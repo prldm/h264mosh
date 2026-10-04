@@ -64,23 +64,43 @@ Egyetlen külső függőség: **ffmpeg** (libx264-gyel) és a mellé tartozó ff
 cargo run --release -p h264mosh-gui
 ```
 
-Egui/eframe alapú szerkesztő ugyanabban a folyamatban, mint a mag (`gui/`). Az első fázis kész:
+Egui/eframe alapú szerkesztő ugyanabban a folyamatban, mint a mag (`gui/`).
 
-- **Megnyitás:** az *Open…* gombbal vagy az ablakba húzva. A klipeket a `prep --cavlc` beállításaival kódolja újra a felhasználói cache-mappába (Windows: `%LOCALAPPDATA%\h264mosh\imports`, macOS: `~/Library/Caches`, Linux: `~/.cache`). Egyetlen nyers `.264` stream változatlanul nyílik meg. Az újrakódolás haladása látszik, és megszakítható.
+- **Megnyitás:** *File → Open…* (Ctrl+O), a középső *Open…* gomb, vagy az ablakba húzás. Projektfájlt és videoklipeket egyaránt megnyit.
+  - A klipeket a `prep --cavlc` beállításaival kódolja újra a felhasználói cache-mappába (Windows: `%LOCALAPPDATA%\h264mosh\imports`, macOS: `~/Library/Caches`, Linux: `~/.cache`). Az újrakódolás haladása látszik, és megszakítható.
+  - Egyetlen nyers `.264` stream változatlanul nyílik meg.
+- **Projektfájl:** `.h264mosh` kiterjesztés, JSON-tartalom. Mentés Ctrl+S, mentés másként Ctrl+Shift+S; a *File → Open recent* a legutóbbi fájlokat kínálja.
+  - A fájlban benne vannak az eredeti klipek, az újrakódolt stream és annak hash-e, valamint a teljes szerkesztés (kockák, effektek, seed).
+  - Ha az újrakódolt stream eltűnt a cache-ből, az eredeti klipekből újra elkészül.
+  - Nem mentett változások esetén a cím elején • jelenik meg, és megnyitás vagy kilépés előtt rákérdez a mentésre.
 - **Timeline:** egy kocka egy forrás-frame. Görgővel lapoz, Ctrl+görgővel (vagy a csúszkával) zoomol a bélyegképektől az I/P vonalkódig (narancs = I).
-  - Kijelölés: kattintás, Shift (tartomány), Ctrl (hozzáadás vagy elvétel).
-  - Áthelyezés: a kijelölés húzással mozgatható.
+  - Kijelölés: kattintás, Shift (tartomány), Ctrl (hozzáadás vagy elvétel). Áthelyezés: a kijelölés húzással mozgatható.
   - Törlés (Del): a helyén szaggatott keretes üres hely marad visszaállító gombbal, egészen a renderelésig.
-  - Duplikálás: *Duplicate* / *One less*, vagy görgő a kocka ×N jelvényén.
+  - Keyframe-dobás (`D`): a kijelölt I-frame-eket törli; kijelölés nélkül az első kivételével az összeset.
+  - Duplikálás: *Duplicate* / *One less* (`B` / `Shift+B`). A darabszám a görgővel is állítható a kocka ×N jelvényén, vagy a `B` lenyomva tartása közben.
   - A nem renderelt változások fölött sárga csíkos sáv jelenik meg, a fejléc pedig kiírja a számukat.
-- **Render:** a változtatásokból `mosh::Timeline` lesz, és háttérszálon renderelődik. Ekkor záródnak be a törlések üres helyei; a helyükön piros jel marad, a tooltip megmutatja, mely frame-ek voltak ott. Az *Auto* bekapcsolásával minden változás után magától renderel.
-- **Előnézet:** a legutóbbi render látszik, léptetni a ←/→ és a Home/End billentyűkkel lehet. A kicsinyített frame-eket ugyanaz az ffmpeg szoftveres dekóder adja, mint az exportot. Egy dekódolás a lejátszófej előtti utolsó IDR-től indul, és a lejátszófej körüli frame-eket megtartja a memóriában.
-- **Export:** mp4 (libx264, `slow`, crf 16, mint a `render` parancsnál) vagy nyers `.264`.
+- **Effektek:** a jobb oldali panelen.
+  - Az *Add effect* a kijelölt frame-ekre tesz egy új effektet: motion scale, motion shift, jitter, vector error (mvd-scale), freeze (kill-intra), ghost (zero-residual).
+  - Minden effekt egy sáv a kockák alatt. A blokkok széle húzható, kattintásra a panelen megjelennek a paraméterek (csúszkák), az effekt ki is kapcsolható.
+  - A sávok fentről lefelé alkalmazódnak, a sorrendjük a panelen ⏶/⏷ gombbal állítható.
+  - Az effekt a kockákhoz tartozik: áthelyezett frame-mel együtt mozog. Ahol nem hat (például vektor-effekt I-frame-en), ott a sáv halványabb.
+  - Effektekhez CAVLC stream kell; a videoklipek importja ilyet készít.
+- **Undo/redo:** korlátlan (256 MB-ig), Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. Egy folyamatos mozdulat (csúszkahúzás, görgetés) egy lépésnek számít.
+- **Render:** a változtatásokból `mosh::Timeline` lesz, és háttérszálon renderelődik (`R` vagy a *Render* gomb). Ekkor záródnak be a törlések üres helyei; a helyükön piros jel marad, a tooltip megmutatja, mely frame-ek voltak ott. Az *Auto* bekapcsolásával minden változás után magától renderel.
+- **Előnézet:** a legutóbbi render látszik.
+  - Lejátszás szóközzel. `J`/`L`: hátra/előre, minden további lenyomásra kétszer gyorsabban; `K`: megállít. Léptetés a ←/→ billentyűkkel, ugrás a Home/End billentyűkkel.
+  - Az *Original* gomb vagy a `\` lenyomva tartása az effekt nélküli forrás-frame-et mutatja.
+  - A kicsinyített frame-eket ugyanaz az ffmpeg szoftveres dekóder adja, mint az exportot. Egy dekódolás a lejátszófej előtti utolsó IDR-től indul, és a lejátszófej körüli frame-eket megtartja a memóriában.
+- **Export** (Ctrl+E), három formátum:
+  - *besütött videó*: újrakódolva, minőségválasztóval (high: `slow`/crf 16, lossless: crf 0, kisebb fájl: crf 23);
+  - *mosholt stream mp4-ben*: újrakódolás nélkül (`pipeline::remux`);
+  - *nyers `.264`*.
+- **Súgó:** *Help → Keyboard shortcuts*.
 
 A felület angol, de minden szöveg a `tr!("kulcs")` makrón és a [gui/i18n/en.ftl](gui/i18n/en.ftl) Fluent-fájlon keresztül jön, a számformázással együtt. Új nyelvhez egy `<nyelv>.ftl` fájl és egy sor a `LANGUAGES` táblában ([gui/src/i18n.rs](gui/src/i18n.rs)) kell. Egy teszt figyeli, hogy a kódban használt kulcsok és az angol fájl kulcsai pontosan egyezzenek.
 
 ```bash
-cargo test -p h264mosh-gui                                # modell, i18n, import/szerkesztés/render/export, egérkezelés
+cargo test -p h264mosh-gui                                # modell, undo, i18n, import/projektfájl/render/export, egér, billentyűk, lejátszás
 cargo test -p h264mosh-gui screenshots -- --ignored       # képernyőképek a target/ui-shots mappába (wgpu kell)
 ```
 
@@ -109,6 +129,7 @@ A GUI-hoz fontos tulajdonságok:
 - **Szakasz-dekódolás:** a `segment()` önállóan dekódolható szakaszt ad, a szükséges SPS/PPS-t elé teszi.
 - **Hibatűrés:** ha egy frame-en az effekt hibát dob vagy panikol, az a frame változatlan marad, és a `RenderReport::failed_effects` jelzi. A render ettől nem áll le.
 - **Haladás és megszakítás:** a `pipeline::prep` és a `pipeline::render` callbacken jelzi, hol tart. Ha a callback `false`-t ad vissza, a munka leáll, a hiba pedig `pipeline::Cancelled` lesz.
+- **Szerializálás:** a `serde` feature-rel az `MbEffect`, a `Timeline` és a `TimelineEntry` szerializálható (a GUI projektfájlja ezt használja).
 - **Dekódolás képpé:** a `pipeline::decode_rgba` egy streamből kicsinyített RGBA frame-eket ad sorban, ugyanazzal a szoftveres ffmpeg-dekóderrel, mint az export. Előnézethez és bélyegképekhez.
 
 ## Teljesítmény

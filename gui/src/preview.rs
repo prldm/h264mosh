@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// memory for decoded preview frames
-const CACHE_BYTES: usize = 512 << 20;
 /// a run decodes at most this many frames ahead of the playhead
 const MAX_AHEAD: usize = 240;
 
@@ -63,9 +61,10 @@ pub struct Preview {
 }
 
 impl Preview {
-    pub fn new(tools: Tools, rendered: Arc<Rendered>, size: (u32, u32)) -> Self {
+    /// Frames of `rendered` at `size`, keeping up to `cache_bytes` of decoded frames.
+    pub fn new(tools: Tools, rendered: Arc<Rendered>, size: (u32, u32), cache_bytes: usize) -> Self {
         let frame_bytes = size.0 as usize * size.1 as usize * 4;
-        let capacity = (CACHE_BYTES / frame_bytes).max(8);
+        let capacity = (cache_bytes / frame_bytes).max(8);
         let cache = Cache { frames: HashMap::new(), wanted: 0, capacity };
         Self {
             tools,
@@ -82,6 +81,11 @@ impl Preview {
 
     pub fn rendered(&self) -> &Arc<Rendered> {
         &self.rendered
+    }
+
+    /// Whether output frame `k` is the one on screen.
+    pub fn shows(&self, k: usize) -> bool {
+        self.shown == Some(k)
     }
 
     /// The texture to draw for output frame `k`, and whether it shows `k` already

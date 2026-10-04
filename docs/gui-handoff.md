@@ -141,7 +141,7 @@ Későbbi, nagyobb tételek (mind megoldható, de sok munka):
 
 ## GUI – állapot (2026-10-04)
 
-Az **1. fázis kész** (`gui/`, lásd a README GUI-szakaszát).
+Az **1. és a 2. fázis kész** (`gui/`, lásd a README GUI-szakaszát).
 
 Eldöntött kérdések:
 
@@ -149,32 +149,42 @@ Eldöntött kérdések:
 - MIT OR Apache-2.0 licenc.
 - Cargo workspace.
 - Git repó, a commitok a `prldm` GitHub-fiók noreply címével készülnek; távoli repó még nincs.
+- Az effektblokk a kockákhoz kötődik: áthelyezett frame-mel együtt mozog.
+- A projektfájl JSON, `.h264mosh` kiterjesztéssel.
+- A `D` a kijelölt I-frame-eket dobja; kijelölés nélkül az első kivételével mindet.
 
 Felépítés:
 
-- `edit.rs`: kockamodell; törlés üres hellyel, másolatok, áthelyezés, a renderelésre váró változások, `commit`.
-- `jobs.rs`: háttérmunkák progresszel és megszakítással.
-- `project.rs`: import, render, export, bélyegképek.
-- `preview.rs`: dekódolás a lejátszófej körül, az IDR-től indítva.
-- `timeline.rs`: a frame-sáv widget.
-- `app.rs`: elrendezés és vezérlés.
+- `edit.rs`: kockamodell; törlés üres hellyel, másolatok, áthelyezés, effekt-példányok (sávok) a kockákon, a renderelt kinézet a nem renderelt változásokhoz, valamint `EditState` az undóhoz és a fájlhoz.
+- `history.rs`: undo/redo pillanatképekkel, gesztusonkénti összevonással, 256 MB-os korláttal.
+- `project.rs`: import, projektfájl (mentés és megnyitás, újrakódolás, ha a stream eltűnt), render, export, bélyegképek.
+- `timeline.rs`: a frame-sáv és az effektsávok; az eseményeket az `app` hajtja végre, hogy visszavonhatók legyenek.
+- `panel.rs`: effektpanel.
+- `preview.rs`: dekódolás a lejátszófej körül.
+- `export.rs`: az export három formátuma és a párbeszédablak.
+- `settings.rs`: legutóbbi fájlok és választások, a felhasználói konfigurációs mappában.
+- `app.rs`: menü, gyorsbillentyűk, lejátszás, eredeti nézet, a nem mentett változások kérdése.
 - `i18n.rs` és `i18n/en.ftl`: fordítási réteg.
 
-A magban a `pipeline` kapott haladásjelzést és megszakítást (`PrepProgress`, `Cancelled`), valamint `decode_rgba`-t.
+A magban:
+
+- `pipeline`: haladásjelzés és megszakítás, `decode_rgba`, `remux` (mp4 újrakódolás nélkül);
+- `serde` feature.
 
 Tesztelés:
 
-- Az `egui_kittest`-tel valódi egér-eseményekkel teszteljük a felületet.
-- A `screenshots` teszt (`--ignored`) képeket ment a `target/ui-shots` mappába; így látható a felület ablak nélkül is.
+- Az `egui_kittest`-tel valódi egér- és billentyűeseményekkel teszteljük a felületet.
+- A `screenshots` teszt (`--ignored`) képeket ment a `target/ui-shots` mappába.
+- Az egui alapbetűkészletéből hiányzik a ▲ ▼ ▾ ↑ ↓; van ⏶ ⏷ ⏴ ⏵ ⏸ ⬆ ⬇ ◀ ▶ ↺.
 
-Következő lépés: a 2. fázis (effektsávok, beállítópanel, undo/redo, gyorsbillentyűk, projektfájl `serde`-vel).
+Következő lépés: a 3. fázis (variánsok, wipe/villogtatás, 2×2 paraméterrács).
 
 Ismert hiányok:
 
-- Az előnézetnek nincs lejátszása, csak léptetés.
-- Az export beállításai rögzítettek.
 - A cache-mappába importált klipeket semmi nem takarítja.
-- A mag hibaüzenetei angolul, fordítás nélkül jelennek meg (a GUI csak keretbe teszi őket).
+- A mag hibaüzenetei angolul, fordítás nélkül jelennek meg.
+- A projektfájl abszolút útvonalakat tárol.
+- Gyorsítások még nincsenek a dekódolt képek cache-ében: nincs lánc-hash, nincs újrahasznosítás renderek között.
 
 ## Tesztanyag a gépen
 

@@ -5,10 +5,14 @@
 
 mod app;
 mod edit;
+mod export;
+mod history;
 mod i18n;
 mod jobs;
+mod panel;
 mod preview;
 mod project;
+mod settings;
 mod timeline;
 
 use eframe::egui;
