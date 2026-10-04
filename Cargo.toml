@@ -12,6 +12,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 mimalloc = "0.1.52"
 rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"], optional = true }
 
 # Distribution build: `cargo build --profile dist`. Whole-program optimization gives a
 # few percent single-threaded at the cost of slow builds, so day-to-day release builds
@@ -20,3 +21,6 @@ rayon = "1.12.0"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+[features]
+serde = ["dep:serde"]

@@ -1508,6 +1508,7 @@ dependencies = [
  "clap",
  "mimalloc",
  "rayon",
+ "serde",
 ]
 
 [[package]]

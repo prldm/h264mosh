@@ -3,7 +3,7 @@
 
 use h264mosh::effects::MbEffect;
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
-use h264mosh::pipeline::{Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep};
+use h264mosh::pipeline::{Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
 use h264mosh::pps::Pps;
 use h264mosh::slice::SliceType;
 use h264mosh::stream::{NalKind, Stream, group_access_units};
@@ -505,4 +505,35 @@ fn prep_reports_progress_and_cancels() {
 
     let err = prep(&tools, &inputs, &out, None, None, &enc, &mut |p| !matches!(p, PrepProgress::Frames(_))).unwrap_err();
     assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+}
+
+/// A moshed stream put into mp4 without re-encoding decodes to the same pictures.
+#[test]
+fn remux_keeps_the_moshed_pictures() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let data = mosh_friendly("mandelbrot", 3, &["-coder", "0"]);
+    let src = Source::new(Stream::parse(&data).unwrap());
+    // keyframes 25 and 50 dropped, a freeze, motion effects: parameter sets get re-inserted mid-stream
+    let mut order: Vec<usize> = (0..75).filter(|&s| s != 25 && s != 50).collect();
+    order.splice(30..30, [30; 4]);
+    let mut timeline = Timeline { entries: order.iter().map(|&s| TimelineEntry::new(s)).collect() };
+    for e in &mut timeline.entries[40..50] {
+        e.effects = vec![MbEffect::MvScale(3.0, -2.0)];
+    }
+    let (out, _) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+    let bytes = out.write(false).unwrap();
+    let (raw, err) = decode(&bytes, "remux.264");
+    assert!(err.is_empty(), "{err}");
+    let mp4 = tmp("remux.mp4");
+    remux(&Tools::find(None), &bytes, &mp4, "25", &mut |_| true).unwrap();
+    let out = Command::new(ffmpeg()).args(["-v", "error", "-nostdin", "-i"]).arg(&mp4).args(["-f", "framemd5", "-"]).output().unwrap();
+    let md5: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.rsplit(',').next().unwrap().trim().to_string())
+        .collect();
+    assert_eq!(md5.len(), order.len());
+    assert!(md5 == raw, "remuxed pictures differ");
 }

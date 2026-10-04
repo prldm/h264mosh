@@ -379,6 +379,19 @@ pub fn render(
     Ok(())
 }
 
+/// Put a raw stream into a container (mp4, mkv, ...) as it is, without re-encoding:
+/// players decode the moshed stream themselves. `progress` as in `render`.
+pub fn remux(tools: &Tools, data: &[u8], output: &Path, fps: &str, progress: &mut dyn FnMut(u64) -> bool) -> Result<()> {
+    let mut cmd = tools.ffmpeg_with_progress();
+    cmd.args(["-y", "-f", "h264", "-framerate", fps, "-i", "pipe:0", "-c:v", "copy"]);
+    if output.extension().is_some_and(|e| e == OsStr::new("mp4") || e == OsStr::new("mov")) {
+        cmd.args(["-movflags", "+faststart"]);
+    }
+    cmd.arg(output);
+    tools.run_with_progress(cmd, data, progress)?;
+    Ok(())
+}
+
 /// Decode a raw stream into RGBA frames of `width`x`height` (bilinear scaling), with
 /// the same software decoder as `render`. `on_frame(index, pixels)` gets them in order
 /// and returns false to stop early. Returns the number of frames decoded.
