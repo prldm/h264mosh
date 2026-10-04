@@ -139,6 +139,43 @@ Későbbi, nagyobb tételek (mind megoldható, de sok munka):
 2. CABAC makroblokk-szerkesztés
 3. MV-effektek B-frame-en
 
+## GUI – állapot (2026-10-04)
+
+Az **1. fázis kész** (`gui/`, lásd a README GUI-szakaszát).
+
+Eldöntött kérdések:
+
+- Fluent a fordításhoz.
+- MIT OR Apache-2.0 licenc.
+- Cargo workspace.
+- Git repó, a commitok a `prldm` GitHub-fiók noreply címével készülnek; távoli repó még nincs.
+
+Felépítés:
+
+- `edit.rs`: kockamodell; törlés üres hellyel, másolatok, áthelyezés, a renderelésre váró változások, `commit`.
+- `jobs.rs`: háttérmunkák progresszel és megszakítással.
+- `project.rs`: import, render, export, bélyegképek.
+- `preview.rs`: dekódolás a lejátszófej körül, az IDR-től indítva.
+- `timeline.rs`: a frame-sáv widget.
+- `app.rs`: elrendezés és vezérlés.
+- `i18n.rs` és `i18n/en.ftl`: fordítási réteg.
+
+A magban a `pipeline` kapott haladásjelzést és megszakítást (`PrepProgress`, `Cancelled`), valamint `decode_rgba`-t.
+
+Tesztelés:
+
+- Az `egui_kittest`-tel valódi egér-eseményekkel teszteljük a felületet.
+- A `screenshots` teszt (`--ignored`) képeket ment a `target/ui-shots` mappába; így látható a felület ablak nélkül is.
+
+Következő lépés: a 2. fázis (effektsávok, beállítópanel, undo/redo, gyorsbillentyűk, projektfájl `serde`-vel).
+
+Ismert hiányok:
+
+- Az előnézetnek nincs lejátszása, csak léptetés.
+- Az export beállításai rögzítettek.
+- A cache-mappába importált klipeket semmi nem takarítja.
+- A mag hibaüzenetei angolul, fordítás nélkül jelennek meg (a GUI csak keretbe teszi őket).
+
 ## Tesztanyag a gépen
 
 - `vidi1.mp4` (720p), `vidi2.mp4` (1080p), mindkettő a projekt gyökerében.

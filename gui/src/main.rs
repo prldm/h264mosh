@@ -4,7 +4,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod edit;
 mod i18n;
+mod jobs;
+mod preview;
+mod project;
+mod timeline;
 
 use eframe::egui;
 

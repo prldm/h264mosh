@@ -460,7 +460,14 @@ fn rgba_decode_gives_one_picture_per_frame() {
 
     // stopping early ends the decoder without an error
     let mut seen = 0;
-    assert_eq!(decode_rgba(&tools, &data, size, |_, _| { seen += 1; seen < 3 }).unwrap(), 3);
+    assert_eq!(
+        decode_rgba(&tools, &data, size, |_, _| {
+            seen += 1;
+            seen < 3
+        })
+        .unwrap(),
+        3
+    );
 }
 
 /// `prep` reports progress and can be cancelled.
@@ -477,7 +484,8 @@ fn prep_reports_progress_and_cancels() {
         .status()
         .unwrap();
     assert!(status.success());
-    let enc = EncodeSettings { preset: "ultrafast".into(), crf: 23.0, keyint: "250".into(), scenecut: true, cavlc: true, x264_params: None };
+    let enc =
+        EncodeSettings { preset: "ultrafast".into(), crf: 23.0, keyint: "250".into(), scenecut: true, cavlc: true, x264_params: None };
     let inputs = [clip.clone(), clip];
     let out = tmp("prep_out.264");
     let mut events = Vec::new();

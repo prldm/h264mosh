@@ -382,7 +382,12 @@ pub fn render(
 /// Decode a raw stream into RGBA frames of `width`x`height` (bilinear scaling), with
 /// the same software decoder as `render`. `on_frame(index, pixels)` gets them in order
 /// and returns false to stop early. Returns the number of frames decoded.
-pub fn decode_rgba(tools: &Tools, data: &[u8], (width, height): (u32, u32), mut on_frame: impl FnMut(usize, Vec<u8>) -> bool) -> Result<usize> {
+pub fn decode_rgba(
+    tools: &Tools,
+    data: &[u8],
+    (width, height): (u32, u32),
+    mut on_frame: impl FnMut(usize, Vec<u8>) -> bool,
+) -> Result<usize> {
     let mut cmd = tools.ffmpeg();
     cmd.args(["-f", "h264", "-i", "pipe:0", "-vf"]).arg(format!("scale={width}:{height}:flags=bilinear"));
     cmd.args(["-pix_fmt", "rgba", "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]);

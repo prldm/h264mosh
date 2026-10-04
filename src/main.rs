@@ -469,7 +469,9 @@ fn main() -> Result<()> {
             let enc = EncodeSettings { preset, crf, keyint, scenecut: !no_scenecut, cavlc, x264_params };
             let clips = pipeline::prep(&tools, &inputs, &output, size, fps, &enc, &mut |p| {
                 match p {
-                    PrepProgress::Start { width, height, fps, clips } => eprintln!("encoding {clips} clip(s) at {width}x{height}, {fps} fps"),
+                    PrepProgress::Start { width, height, fps, clips } => {
+                        eprintln!("encoding {clips} clip(s) at {width}x{height}, {fps} fps")
+                    }
                     PrepProgress::Clip { index, path, .. } => eprintln!("  [{}/{}] {}", index + 1, inputs.len(), path.display()),
                     PrepProgress::Frames(_) => {}
                 }

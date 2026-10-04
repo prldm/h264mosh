@@ -58,6 +58,34 @@ h264mosh roundtrip vidi1.mp4 --mb     # parse + újraírás bitre azonos-e (--mb
 
 Egyetlen külső függőség: **ffmpeg** (libx264-gyel) és a mellé tartozó ffprobe. Keresési sorrend: `--ffmpeg PATH` opció, `$H264MOSH_FFMPEG`, végül a PATH; az ffprobe-ot az ffmpeg mellől veszi. Nyers `.264` bemenethez (`mosh`, `info`, `roundtrip`) nem kell ffmpeg. A `prep` extra libx264-opciókat a `--x264-params "k=v:k=v"` kapcsolóval kap.
 
+## GUI
+
+```bash
+cargo run --release -p h264mosh-gui
+```
+
+Egui/eframe alapú szerkesztő ugyanabban a folyamatban, mint a mag (`gui/`). Az első fázis kész:
+
+- **Megnyitás:** az *Open…* gombbal vagy az ablakba húzva. A klipeket a `prep --cavlc` beállításaival kódolja újra a felhasználói cache-mappába (Windows: `%LOCALAPPDATA%\h264mosh\imports`, macOS: `~/Library/Caches`, Linux: `~/.cache`). Egyetlen nyers `.264` stream változatlanul nyílik meg. Az újrakódolás haladása látszik, és megszakítható.
+- **Timeline:** egy kocka egy forrás-frame. Görgővel lapoz, Ctrl+görgővel (vagy a csúszkával) zoomol a bélyegképektől az I/P vonalkódig (narancs = I).
+  - Kijelölés: kattintás, Shift (tartomány), Ctrl (hozzáadás vagy elvétel).
+  - Áthelyezés: a kijelölés húzással mozgatható.
+  - Törlés (Del): a helyén szaggatott keretes üres hely marad visszaállító gombbal, egészen a renderelésig.
+  - Duplikálás: *Duplicate* / *One less*, vagy görgő a kocka ×N jelvényén.
+  - A nem renderelt változások fölött sárga csíkos sáv jelenik meg, a fejléc pedig kiírja a számukat.
+- **Render:** a változtatásokból `mosh::Timeline` lesz, és háttérszálon renderelődik. Ekkor záródnak be a törlések üres helyei; a helyükön piros jel marad, a tooltip megmutatja, mely frame-ek voltak ott. Az *Auto* bekapcsolásával minden változás után magától renderel.
+- **Előnézet:** a legutóbbi render látszik, léptetni a ←/→ és a Home/End billentyűkkel lehet. A kicsinyített frame-eket ugyanaz az ffmpeg szoftveres dekóder adja, mint az exportot. Egy dekódolás a lejátszófej előtti utolsó IDR-től indul, és a lejátszófej körüli frame-eket megtartja a memóriában.
+- **Export:** mp4 (libx264, `slow`, crf 16, mint a `render` parancsnál) vagy nyers `.264`.
+
+A felület angol, de minden szöveg a `tr!("kulcs")` makrón és a [gui/i18n/en.ftl](gui/i18n/en.ftl) Fluent-fájlon keresztül jön, a számformázással együtt. Új nyelvhez egy `<nyelv>.ftl` fájl és egy sor a `LANGUAGES` táblában ([gui/src/i18n.rs](gui/src/i18n.rs)) kell. Egy teszt figyeli, hogy a kódban használt kulcsok és az angol fájl kulcsai pontosan egyezzenek.
+
+```bash
+cargo test -p h264mosh-gui                                # modell, i18n, import/szerkesztés/render/export, egérkezelés
+cargo test -p h264mosh-gui screenshots -- --ignored       # képernyőképek a target/ui-shots mappába (wgpu kell)
+```
+
+A `screenshots` alapból tesztábrával fut; a `$H264MOSH_SHOT_INPUT` egy saját klipre állítja át.
+
 ## Library API (GUI-hoz)
 
 A szerkesztés adatként írható le: egy `mosh::Timeline` a kimeneti frame-ek listája. Minden bejegyzés egy bemeneti frame-re mutat (`src`), és saját `effects: Vec<MbEffect>` listája és `seed`-je van. A véletlenszerű effektek (jitter) a bejegyzés seedjét használják, így ha máshol szerkeszted a timeline-t, az adott frame nem változik meg. A frame-ek szabadon sorba rendezhetők, ismételhetők és kihagyhatók; a `mosh::render(&Source, &Timeline, &RenderOptions)` ebből szabályos streamet készít. A CLI `MoshPlan`-je is erre fordul le.
@@ -80,6 +108,8 @@ A GUI-hoz fontos tulajdonságok:
 - **Frame-térkép:** a `RenderReport::frames` megmondja, melyik kimeneti frame melyik bemeneti frame, IDR-e, és mely NAL-okból áll. A `Stream::write_with_offsets` megadja a bájt-pozíciókat.
 - **Szakasz-dekódolás:** a `segment()` önállóan dekódolható szakaszt ad, a szükséges SPS/PPS-t elé teszi.
 - **Hibatűrés:** ha egy frame-en az effekt hibát dob vagy panikol, az a frame változatlan marad, és a `RenderReport::failed_effects` jelzi. A render ettől nem áll le.
+- **Haladás és megszakítás:** a `pipeline::prep` és a `pipeline::render` callbacken jelzi, hol tart. Ha a callback `false`-t ad vissza, a munka leáll, a hiba pedig `pipeline::Cancelled` lesz.
+- **Dekódolás képpé:** a `pipeline::decode_rgba` egy streamből kicsinyített RGBA frame-eket ad sorban, ugyanazzal a szoftveres ffmpeg-dekóderrel, mint az export. Előnézethez és bélyegképekhez.
 
 ## Teljesítmény
 
