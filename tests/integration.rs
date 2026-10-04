@@ -3,6 +3,7 @@
 
 use h264mosh::effects::MbEffect;
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
+use h264mosh::pipeline::{Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep};
 use h264mosh::pps::Pps;
 use h264mosh::slice::SliceType;
 use h264mosh::stream::{NalKind, Stream, group_access_units};
@@ -417,4 +418,83 @@ fn jitter_is_stable_when_the_timeline_changes() {
     let mut c = a.clone();
     c.entries[10].seed ^= 1;
     assert_ne!(slice_data(&a, 10), slice_data(&c, 10));
+}
+
+/// Previews are decoded with `pipeline::decode_rgba`: one picture per frame, in order,
+/// also for moshed streams, and a segment gives the same pictures as the full stream.
+#[test]
+fn rgba_decode_gives_one_picture_per_frame() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let tools = Tools::find(None);
+    let data = mosh_friendly("mandelbrot", 3, &["-coder", "0"]);
+    let src = Source::new(Stream::parse(&data).unwrap());
+    // keyframe 25 dropped, frame 60 repeated, strong effects on a stretch of P-frames
+    let mut order: Vec<usize> = (0..75).filter(|&s| s != 25).collect();
+    let at = order.iter().position(|&s| s == 60).unwrap();
+    order.splice(at..at, [60; 5]);
+    let mut timeline = Timeline { entries: order.iter().map(|&s| TimelineEntry::new(s)).collect() };
+    for e in &mut timeline.entries[30..40] {
+        e.effects = vec![MbEffect::MvScale(5.0, -3.0), MbEffect::KillIntra];
+    }
+    let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+    let size = (64, 40);
+    let decode_all = |bytes: &[u8]| {
+        let mut pictures = Vec::new();
+        let n = decode_rgba(&tools, bytes, size, |i, px| {
+            assert_eq!((i, px.len()), (pictures.len(), 64 * 40 * 4));
+            pictures.push(px);
+            true
+        })
+        .unwrap();
+        assert_eq!(n, pictures.len());
+        pictures
+    };
+    let full = decode_all(&out.write(false).unwrap());
+    assert_eq!(full.len(), order.len());
+    let k = order.len() - 1;
+    let r = rep.restart_point(k);
+    assert!(r > 0);
+    assert!(decode_all(&segment(&out, &rep.frames, r..k + 1).unwrap()) == full[r..=k], "segment {r}..={k}");
+
+    // stopping early ends the decoder without an error
+    let mut seen = 0;
+    assert_eq!(decode_rgba(&tools, &data, size, |_, _| { seen += 1; seen < 3 }).unwrap(), 3);
+}
+
+/// `prep` reports progress and can be cancelled.
+#[test]
+fn prep_reports_progress_and_cancels() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let tools = Tools::find(None);
+    let clip = tmp("prep_in.mp4");
+    let status = Command::new(ffmpeg())
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x192:rate=25", "-t", "2", "-c:v", "libx264"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let enc = EncodeSettings { preset: "ultrafast".into(), crf: 23.0, keyint: "250".into(), scenecut: true, cavlc: true, x264_params: None };
+    let inputs = [clip.clone(), clip];
+    let out = tmp("prep_out.264");
+    let mut events = Vec::new();
+    let clips = prep(&tools, &inputs, &out, None, None, &enc, &mut |p| {
+        events.push(match p {
+            PrepProgress::Start { width, height, clips, .. } => format!("start {width}x{height} {clips}"),
+            PrepProgress::Clip { index, frames, .. } => format!("clip {index} {frames:?}"),
+            PrepProgress::Frames(n) => format!("frames {n}"),
+        });
+        true
+    })
+    .unwrap();
+    assert_eq!(clips.iter().map(|c| c.frames).collect::<Vec<_>>(), [50, 50]);
+    assert_eq!(events[..2], ["start 320x192 2", "clip 0 Some(50)"]);
+    assert!(events.contains(&"frames 50".to_string()), "{events:?}");
+    assert!(events.contains(&"clip 1 Some(50)".to_string()), "{events:?}");
+
+    let err = prep(&tools, &inputs, &out, None, None, &enc, &mut |p| !matches!(p, PrepProgress::Frames(_))).unwrap_err();
+    assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
 }

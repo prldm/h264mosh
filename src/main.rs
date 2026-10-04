@@ -5,7 +5,7 @@ use h264mosh::mb::{self, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, decode_pocs, mosh};
 use h264mosh::motion;
 use h264mosh::nal::nal_type_name;
-use h264mosh::pipeline::{self, EncodeSettings, Tools};
+use h264mosh::pipeline::{self, EncodeSettings, PrepProgress, Tools};
 use h264mosh::range::{DupSpec, RangeSet};
 use h264mosh::slice::SliceType;
 use h264mosh::stream::{AccessUnit, NalKind, Stream, group_access_units};
@@ -467,7 +467,14 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Prep { inputs, output, size, fps, crf, preset, keyint, no_scenecut, cavlc, x264_params } => {
             let enc = EncodeSettings { preset, crf, keyint, scenecut: !no_scenecut, cavlc, x264_params };
-            let clips = pipeline::prep(&tools, &inputs, &output, size, fps, &enc)?;
+            let clips = pipeline::prep(&tools, &inputs, &output, size, fps, &enc, &mut |p| {
+                match p {
+                    PrepProgress::Start { width, height, fps, clips } => eprintln!("encoding {clips} clip(s) at {width}x{height}, {fps} fps"),
+                    PrepProgress::Clip { index, path, .. } => eprintln!("  [{}/{}] {}", index + 1, inputs.len(), path.display()),
+                    PrepProgress::Frames(_) => {}
+                }
+                true
+            })?;
             println!("written {}", output.display());
             for (i, c) in clips.iter().enumerate() {
                 println!(
@@ -496,7 +503,10 @@ fn main() -> Result<()> {
             cmd_mosh(&tools, &input, &output, plan)?;
         }
         Cmd::Render { input, output, fps, crf, preset } => {
-            pipeline::render(&tools, &input, &output, fps, &preset, crf)?;
+            let data = std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            let fps = fps.unwrap_or_else(|| pipeline::stream_fps(&data));
+            eprintln!("rendering {} -> {} ({fps} fps)", input.display(), output.display());
+            pipeline::render(&tools, &data, &output, &fps, &preset, crf, &mut |_| true)?;
             println!("written {}", output.display());
         }
         Cmd::Info { input, frames, mbs } => cmd_info(&tools, &input, frames, mbs)?,
