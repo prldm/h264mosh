@@ -1,0 +1,18 @@
+[package]
+name = "h264mosh-gui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = "0.36.2"
+fluent-bundle = "0.16.0"
+h264mosh = { path = ".." }
+mimalloc = "0.1.52"
+rfd = "0.17.2"
+unic-langid = "0.9.6"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
