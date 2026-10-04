@@ -1,0 +1,7 @@
+/target/
+/out/
+# test footage stays local
+*.mp4
+*.mov
+*.mkv
+*.264

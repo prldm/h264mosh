@@ -1,0 +1,161 @@
+//! Self checks: bit-exact re-serialization and frame_num conformance.
+
+use crate::common::RbspTail;
+use crate::mb;
+use crate::stream::{AccessUnit, NalKind, Stream};
+use anyhow::Result;
+use rayon::prelude::*;
+use std::collections::BTreeMap;
+
+#[derive(Default)]
+pub struct RoundtripReport {
+    /// per NAL type name: (re-serialized ok, mismatched)
+    pub by_type: BTreeMap<&'static str, (usize, usize)>,
+    pub passthrough: usize,
+    /// SPS/PPS whose data after the parsed syntax is not plain rbsp_trailing_bits
+    pub raw_tails: usize,
+    /// (NAL index, description) of the first few mismatches
+    pub mismatches: Vec<(usize, String)>,
+    pub total_mismatches: usize,
+    /// passthrough write reproduces the input file
+    pub file_identical: bool,
+    /// forced re-serialization of every parsed unit reproduces the input file
+    pub reserialized_identical: bool,
+}
+
+pub fn roundtrip(data: &[u8], stream: &Stream) -> Result<RoundtripReport> {
+    let mut rep = RoundtripReport { file_identical: stream.write(false)? == data, ..Default::default() };
+    // per NAL unit, in parallel: (type, has unparsed trailing data, mismatch)
+    let checks: Vec<Option<(&'static str, bool, Option<String>)>> = stream
+        .nals
+        .par_iter()
+        .map(|n| {
+            let (name, raw_tail) = match &n.kind {
+                NalKind::Sps(s) => ("SPS", s.tail != RbspTail::Trailing),
+                NalKind::Pps(p) => ("PPS", p.tail != RbspTail::Trailing),
+                NalKind::Slice(_) => ("slice", false),
+                NalKind::Other => return Ok(None),
+            };
+            let new = n.ebsp(true)?;
+            let mismatch = (new.as_ref() != n.raw.as_slice()).then(|| {
+                let at = new.iter().zip(n.raw.iter()).position(|(a, b)| a != b).unwrap_or(new.len().min(n.raw.len()));
+                format!("first difference at byte {at} (original {} bytes, rewritten {} bytes)", n.raw.len(), new.len())
+            });
+            Ok(Some((name, raw_tail, mismatch)))
+        })
+        .collect::<Result<_>>()?;
+    for (i, check) in checks.into_iter().enumerate() {
+        let Some((name, raw_tail, mismatch)) = check else {
+            rep.passthrough += 1;
+            continue;
+        };
+        rep.raw_tails += raw_tail as usize;
+        let entry = rep.by_type.entry(name).or_default();
+        match mismatch {
+            None => entry.0 += 1,
+            Some(m) => {
+                entry.1 += 1;
+                rep.total_mismatches += 1;
+                if rep.mismatches.len() < 10 {
+                    rep.mismatches.push((i, format!("{name}: {m}")));
+                }
+            }
+        }
+    }
+    rep.reserialized_identical = stream.write(true)? == data;
+    Ok(rep)
+}
+
+/// Frames whose frame_num breaks 7.4.3 (gap or repeat without gaps_in_frame_num_value_allowed_flag).
+pub fn frame_num_violations(aus: &[AccessUnit]) -> Vec<usize> {
+    let mut bad = Vec::new();
+    let mut prev_ref: Option<u32> = None;
+    for (i, au) in aus.iter().enumerate() {
+        let Some(s) = au.first_slice() else { continue };
+        let h = &s.header;
+        if au.is_idr() {
+            if h.frame_num != 0 {
+                bad.push(i);
+            }
+        } else if let Some(p) = prev_ref {
+            let expected = (p + 1) % s.sps.max_frame_num();
+            let second_field = h.field_pic_flag && h.frame_num == p;
+            if h.frame_num != expected && !second_field && !s.sps.gaps_in_frame_num_value_allowed_flag {
+                bad.push(i);
+            }
+        }
+        if au.is_reference() {
+            prev_ref = Some(if h.has_mmco5() { 0 } else { h.frame_num });
+        }
+    }
+    bad
+}
+
+#[derive(Default)]
+pub struct MbRoundtripReport {
+    pub identical: usize,
+    pub different: usize,
+    /// CABAC, MBAFF or otherwise unsupported slices
+    pub skipped: usize,
+    pub macroblocks: usize,
+    /// first few failures: (NAL index, description)
+    pub failures: Vec<(usize, String)>,
+}
+
+enum MbCheck {
+    NotSlice,
+    Unsupported,
+    Checked { macroblocks: usize, problem: Option<String> },
+}
+
+/// Parse the macroblock layer of every CAVLC slice and write it back; the slice data
+/// must come out bit for bit identical. Slices are checked in parallel.
+pub fn mb_roundtrip(stream: &Stream) -> MbRoundtripReport {
+    let checks: Vec<MbCheck> = stream
+        .nals
+        .par_iter()
+        .map(|n| {
+            let Some(slice) = n.slice() else { return MbCheck::NotSlice };
+            if mb::MbContext::new(slice).is_err() {
+                return MbCheck::Unsupported;
+            }
+            let mut macroblocks = 0;
+            let result = mb::parse_slice_data(slice).and_then(|data| {
+                macroblocks = data.mbs.len();
+                mb::write_slice_data(slice, &data)
+            });
+            let (buf, start, end) = slice.slice_data();
+            let problem = match result {
+                Err(e) => Some(format!("{e:#}")),
+                Ok((bytes, bits)) => {
+                    let mut orig = crate::bits::BitWriter::new();
+                    orig.append_bits(buf, start, end);
+                    let orig_bits = orig.bit_len();
+                    (bits != orig_bits || bytes != orig.into_bytes())
+                        .then(|| format!("rewritten slice data differs ({bits} bits vs {orig_bits})"))
+                }
+            };
+            MbCheck::Checked { macroblocks, problem }
+        })
+        .collect();
+    let mut rep = MbRoundtripReport::default();
+    for (i, check) in checks.into_iter().enumerate() {
+        match check {
+            MbCheck::NotSlice => {}
+            MbCheck::Unsupported => rep.skipped += 1,
+            MbCheck::Checked { macroblocks, problem } => {
+                rep.macroblocks += macroblocks;
+                match problem {
+                    None => rep.identical += 1,
+                    Some(p) => {
+                        rep.different += 1;
+                        if rep.failures.len() < 10 {
+                            rep.failures.push((i, p));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rep
+}

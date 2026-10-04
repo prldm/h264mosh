@@ -1,0 +1,19 @@
+[package]
+name = "h264mosh"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+mimalloc = "0.1.52"
+rayon = "1.12.0"
+
+# Distribution build: `cargo build --profile dist`. Whole-program optimization gives a
+# few percent single-threaded at the cost of slow builds, so day-to-day release builds
+# do without it. Panics must keep unwinding (per-frame fault tolerance).
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

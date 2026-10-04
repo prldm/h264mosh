@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.png binary
+*.mp4 binary
+*.264 binary
+*.h264 binary
+*.y4m binary
