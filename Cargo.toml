@@ -3,6 +3,7 @@ name = "h264mosh"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = "Datamoshing for H.264, done on the bitstream"
 
 [workspace]
 members = ["gui"]
