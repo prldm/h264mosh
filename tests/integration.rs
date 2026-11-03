@@ -1,10 +1,12 @@
 //! End-to-end tests. Streams are generated with ffmpeg/libx264 and decoded with ffmpeg;
 //! tests are skipped (with a message) when ffmpeg is not available.
 
-use h264mosh::effects::MbEffect;
+use h264mosh::effects::{Fx, Mask, MbEffect};
+use h264mosh::mb::MbContext;
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
 use h264mosh::pipeline::{Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
 use h264mosh::pps::Pps;
+use h264mosh::residual::Scaling;
 use h264mosh::slice::SliceType;
 use h264mosh::stream::{NalKind, Stream, group_access_units};
 use h264mosh::verify;
@@ -224,7 +226,7 @@ fn mosh_refuses_bframes_and_keeps_first_frame() {
 fn with_effects(data: &[u8], effects: &[MbEffect]) -> Vec<u8> {
     let src = Source::new(Stream::parse(data).unwrap());
     let mut timeline = Timeline::identity(src.len());
-    timeline.entries.iter_mut().for_each(|e| e.effects = effects.to_vec());
+    timeline.entries.iter_mut().for_each(|e| e.effects = effects.iter().cloned().map(Fx::from).collect());
     let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     assert_eq!(rep.effects.slices, src.aus.iter().map(|a| a.slices().count()).sum::<usize>());
     out.write(false).unwrap()
@@ -314,7 +316,7 @@ fn timeline_reorder_and_repeat() {
     for &s in &order {
         timeline.entries.push(TimelineEntry::new(s));
     }
-    timeline.entries[12].effects = vec![MbEffect::MvScale(4.0, 4.0)];
+    timeline.entries[12].effects = vec![MbEffect::MvScale(4.0, 4.0).into()];
     let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     assert_eq!(rep.frames_out, order.len());
     let bytes = out.write(false).unwrap();
@@ -347,7 +349,7 @@ fn segments_decode_like_the_full_stream() {
     order.extend(51..75);
     let mut timeline = Timeline { entries: order.iter().map(|&s| TimelineEntry::new(s)).collect() };
     for e in &mut timeline.entries[30..35] {
-        e.effects = vec![MbEffect::MvScale(3.0, 3.0)];
+        e.effects = vec![MbEffect::MvScale(3.0, 3.0).into()];
     }
     let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     assert_eq!(rep.frames.iter().map(|f| f.src).collect::<Vec<_>>(), order);
@@ -386,7 +388,7 @@ fn failing_frame_effects_are_skipped() {
         }
     }
     let mut timeline = Timeline::identity(src.len());
-    timeline.entries.iter_mut().for_each(|e| e.effects = vec![MbEffect::MvScale(2.0, 2.0)]);
+    timeline.entries.iter_mut().for_each(|e| e.effects = vec![MbEffect::MvScale(2.0, 2.0).into()]);
     let (_, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     assert_eq!(rep.failed_effects.len(), 1, "{:?}", rep.failed_effects);
     assert_eq!(rep.failed_effects[0].0, 10);
@@ -403,9 +405,9 @@ fn jitter_is_stable_when_the_timeline_changes() {
     let data = mosh_friendly("mandelbrot", 1, &["-coder", "0"]);
     let src = Source::new(Stream::parse(&data).unwrap());
     let mut a = Timeline::identity(src.len());
-    a.entries.iter_mut().for_each(|e| e.effects = vec![MbEffect::MvJitter(40)]);
+    a.entries.iter_mut().for_each(|e| e.effects = vec![MbEffect::MvJitter(40).into()]);
     let mut b = a.clone();
-    b.entries.insert(3, TimelineEntry { src: 2, effects: vec![MbEffect::MvJitter(40)], seed: 99 });
+    b.entries.insert(3, TimelineEntry { src: 2, effects: vec![MbEffect::MvJitter(40).into()], seed: 99 });
     let slice_data = |tl: &Timeline, k: usize| {
         let (out, rep) = render(&src, tl, &RenderOptions::default()).unwrap();
         let slice = out.nals[rep.frames[k].nals.clone()].iter().find_map(|n| n.slice()).unwrap().clone();
@@ -436,7 +438,7 @@ fn rgba_decode_gives_one_picture_per_frame() {
     order.splice(at..at, [60; 5]);
     let mut timeline = Timeline { entries: order.iter().map(|&s| TimelineEntry::new(s)).collect() };
     for e in &mut timeline.entries[30..40] {
-        e.effects = vec![MbEffect::MvScale(5.0, -3.0), MbEffect::KillIntra];
+        e.effects = vec![MbEffect::MvScale(5.0, -3.0).into(), MbEffect::KillIntra.into()];
     }
     let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     let size = (64, 40);
@@ -484,8 +486,15 @@ fn prep_reports_progress_and_cancels() {
         .status()
         .unwrap();
     assert!(status.success());
-    let enc =
-        EncodeSettings { preset: "ultrafast".into(), crf: 23.0, keyint: "250".into(), scenecut: true, cavlc: true, x264_params: None };
+    let enc = EncodeSettings {
+        preset: "ultrafast".into(),
+        crf: 23.0,
+        keyint: "250".into(),
+        scenecut: true,
+        cavlc: true,
+        refs: 1,
+        x264_params: None,
+    };
     let inputs = [clip.clone(), clip];
     let out = tmp("prep_out.264");
     let mut events = Vec::new();
@@ -520,7 +529,7 @@ fn remux_keeps_the_moshed_pictures() {
     order.splice(30..30, [30; 4]);
     let mut timeline = Timeline { entries: order.iter().map(|&s| TimelineEntry::new(s)).collect() };
     for e in &mut timeline.entries[40..50] {
-        e.effects = vec![MbEffect::MvScale(3.0, -2.0)];
+        e.effects = vec![MbEffect::MvScale(3.0, -2.0).into()];
     }
     let (out, _) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     let bytes = out.write(false).unwrap();
@@ -536,4 +545,330 @@ fn remux_keeps_the_moshed_pictures() {
         .collect();
     assert_eq!(md5.len(), order.len());
     assert!(md5 == raw, "remuxed pictures differ");
+}
+
+/// CAVLC streams covering what the new macroblock effects depend on: 4x4 and 8x8
+/// transforms, slices, constrained intra prediction, chroma formats, bit depth,
+/// scaling matrices and several reference frames.
+fn cavlc_configs() -> Vec<(&'static str, Vec<u8>)> {
+    let x = |params: &str, extra: &[&'static str]| {
+        let mut args = vec!["-coder", "0", "-g", "25", "-x264-params"];
+        let params = format!("bframes=0:weightp=0:scenecut=0:{params}");
+        args.push(&params);
+        args.extend_from_slice(extra);
+        let pix = if extra.contains(&"-pix_fmt") { vec![] } else { vec!["-pix_fmt", "yuv420p"] };
+        args.extend(pix);
+        encode("testsrc2", 2, &args)
+    };
+    vec![
+        ("8x8", x("ref=1", &[])),
+        ("4x4", x("ref=1:8x8dct=0", &[])),
+        ("slices+constrained", x("ref=1:slices=3:constrained-intra=1", &[])),
+        ("ref3", x("ref=3", &[])),
+        ("cqm", x("ref=1:cqm=jvt", &[])),
+        ("i444", x("ref=1", &["-pix_fmt", "yuv444p"])),
+        ("i422", x("ref=1", &["-pix_fmt", "yuv422p"])),
+        ("10bit", x("ref=1", &["-pix_fmt", "yuv420p10le"])),
+    ]
+}
+
+/// Every new macroblock effect, on every frame: the result decodes without a single
+/// complaint, has all its frames, looks different, and parses back bit for bit.
+#[test]
+fn new_effects_decode_cleanly() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let effects = [
+        MbEffect::IntraMode(0),
+        MbEffect::IntraMode(4),
+        MbEffect::IntraMode(8),
+        MbEffect::IntraRotate(3),
+        MbEffect::IntraRandom(0.7),
+        MbEffect::IntraCascade(5),
+        MbEffect::QpAdd(18),
+        MbEffect::QpAdd(-12),
+        MbEffect::QpSet(51),
+        MbEffect::Coeffs(0.0, 6.0),
+        MbEffect::Coeffs(0.3, 0.0),
+        MbEffect::Coeffs(0.0, -1.0),
+        MbEffect::DcShift(30, 20, -20),
+        MbEffect::Transplant(30, 0.6),
+    ];
+    for (name, data) in cavlc_configs() {
+        let (orig, _) = decode(&data, "new_fx_orig.264");
+        let mut cases: Vec<Vec<MbEffect>> = effects.iter().map(|e| vec![e.clone()]).collect();
+        cases.push(vec![MbEffect::QpAdd(30), MbEffect::Coeffs(0.0, 8.0), MbEffect::DcShift(60, 60, 60)]);
+        if name == "ref3" {
+            cases.push(vec![MbEffect::RefShift(2)]);
+        }
+        for fx in cases {
+            let out = with_effects(&data, &fx);
+            let (md5, err) = decode(&out, "new_fx.264");
+            assert!(err.is_empty(), "{name} {fx:?}: decoder complained: {err}");
+            assert_eq!(md5.len(), orig.len(), "{name} {fx:?}");
+            assert_ne!(md5, orig, "{name} {fx:?} had no visible effect");
+            assert_bit_exact(&out);
+        }
+    }
+}
+
+/// Effects that change nothing must not change a bit: this re-codes intra directions,
+/// quantizers, reference indices and (transplanting a frame into itself) whole
+/// macroblocks against their neighbours.
+#[test]
+fn identity_effects_are_bit_exact() {
+    if !ffmpeg_available() {
+        return;
+    }
+    for (name, data) in cavlc_configs() {
+        for fx in
+            [MbEffect::IntraRotate(0), MbEffect::QpAdd(0), MbEffect::Coeffs(0.0, 1.0), MbEffect::RefShift(0), MbEffect::DcShift(0, 0, 0)]
+        {
+            assert!(with_effects(&data, std::slice::from_ref(&fx)) == data, "{name} {fx:?} changed the stream");
+        }
+        let src = Source::new(Stream::parse(&data).unwrap());
+        let mut timeline = Timeline::identity(src.len());
+        for k in [0, 7, 30] {
+            timeline.entries[k].effects = vec![MbEffect::Transplant(k, 1.0).into()];
+        }
+        let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+        assert!(rep.failed_effects.is_empty(), "{:?}", rep.failed_effects);
+        assert!(out.write(false).unwrap() == data, "{name}: transplanting frames into themselves changed them");
+    }
+}
+
+/// Every intra direction, also where a block lacks the samples it needs (picture and
+/// slice edges, inter neighbours with constrained intra prediction): ffmpeg rejects
+/// such directions, so a clean decode shows they were replaced.
+#[test]
+fn intra_directions_respect_available_samples() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let all_intra = encode("testsrc2", 1, &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "keyint=1:slices=4"]);
+    let constrained =
+        encode("mandelbrot", 1, &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:constrained-intra=1:8x8dct=0"]);
+    for (name, data) in [("all intra", &all_intra), ("constrained", &constrained)] {
+        for d in 0..=8 {
+            let out = with_effects(data, &[MbEffect::IntraMode(d)]);
+            let (_, err) = decode(&out, "intra_dirs.264");
+            assert!(err.is_empty(), "{name}, direction {d}: {err}");
+        }
+    }
+}
+
+/// Decode to 8-bit luma planes.
+fn decode_luma(data: &[u8], name: &str) -> Vec<Vec<u8>> {
+    let path = tmp(name);
+    std::fs::write(&path, data).unwrap();
+    let out = Command::new(ffmpeg())
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(&path)
+        .args(["-pix_fmt", "gray", "-f", "rawvideo", "-"])
+        .output()
+        .expect("ffmpeg");
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    out.stdout.chunks(320 * 192).map(<[u8]>::to_vec).collect()
+}
+
+/// A masked effect changes the masked area and leaves the rest of the picture alone.
+#[test]
+fn masked_effects_leave_the_rest_alone() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let data = mosh_friendly("mandelbrot", 1, &["-coder", "0"]);
+    let src = Source::new(Stream::parse(&data).unwrap());
+    let orig = decode_luma(&data, "mask_orig.264");
+    let left_half = Mask::rect(0.0, 0.0, 0.5, 1.0);
+    for effect in [MbEffect::ZeroResidual, MbEffect::MvScale(3.0, -2.0), MbEffect::QpAdd(12), MbEffect::Coeffs(0.0, 4.0)] {
+        let mut timeline = Timeline::identity(src.len());
+        timeline.entries[5].effects = vec![Fx { effect: effect.clone(), mask: Some(left_half.clone()) }];
+        let (out, _) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+        let luma = decode_luma(&out.write(false).unwrap(), "mask.264");
+        assert_eq!(luma[..5], orig[..5], "{effect:?}");
+        let cols = |p: &[u8], from: usize, to: usize| -> Vec<u8> { p.chunks(320).flat_map(|row| row[from..to].to_vec()).collect() };
+        // the right quarter, away from the edge of the mask and its deblocking
+        assert_eq!(cols(&luma[5], 240, 320), cols(&orig[5], 240, 320), "{effect:?} changed pixels outside the mask");
+        assert_ne!(cols(&luma[5], 0, 150), cols(&orig[5], 0, 150), "{effect:?} changed nothing inside the mask");
+    }
+    // uncoded macroblocks outside keep their quantizer, and with it their deblocking:
+    // only the edge of the mask is filtered differently
+    let mut timeline = Timeline::identity(src.len());
+    timeline.entries[5].effects = vec![Fx { effect: MbEffect::QpAdd(20), mask: Some(left_half.clone()) }];
+    let (out, _) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+    let luma = decode_luma(&out.write(false).unwrap(), "mask_qp.264");
+    let cols = |p: &[u8]| -> Vec<u8> { p.chunks(320).flat_map(|row| row[164..].to_vec()).collect() };
+    assert_eq!(cols(&luma[5]), cols(&orig[5]));
+    // an inverted mask spares the inside
+    let mut timeline = Timeline::identity(src.len());
+    timeline.entries[5].effects = vec![Fx { effect: MbEffect::ZeroResidual, mask: Some(Mask { invert: true, ..left_half }) }];
+    let (out, _) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+    let luma = decode_luma(&out.write(false).unwrap(), "mask_inv.264");
+    let cols = |p: &[u8]| -> Vec<u8> { p.chunks(320).flat_map(|row| row[..80].to_vec()).collect() };
+    assert_eq!(cols(&luma[5]), cols(&orig[5]));
+}
+
+/// Encoders keep their levels within the value ranges of the inverse transform; the
+/// check effects rely on must agree, also at extreme quantizers, with scaling
+/// matrices and in 4:4:4, and what effects produce must pass it.
+#[test]
+fn residual_ranges_accept_encoder_output() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let mut streams: Vec<(&str, Vec<u8>)> = cavlc_configs();
+    for (name, params, pix) in [
+        ("qp1", "qp=1", "yuv420p"),
+        ("qp1 444", "qp=1:8x8dct=1", "yuv444p"),
+        ("lossless", "qp=0", "yuv420p"),
+        ("cqm 444", "cqm=jvt:qp=4", "yuv444p"),
+        ("qp1 10bit", "qp=1", "yuv422p10le"),
+    ] {
+        let params = format!("bframes=0:{params}");
+        streams.push((name, encode("testsrc2", 1, &["-coder", "0", "-pix_fmt", pix, "-x264-params", &params])));
+    }
+    let check = |name: &str, data: &[u8]| {
+        let stream = Stream::parse(data).unwrap();
+        let mut checked = 0;
+        for s in stream.nals.iter().filter_map(|n| n.slice()) {
+            let ctx = MbContext::new(s).unwrap();
+            let scaling = Scaling::new(&ctx);
+            for (i, mb) in h264mosh::mb::parse_slice_data(s).unwrap().mbs.iter().enumerate().filter(|(_, m)| m.has_residual()) {
+                assert!(scaling.fits(mb, mb.qp), "{name}: macroblock {i} of a slice does not fit at QP {}", mb.qp);
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "{name}");
+    };
+    for (name, data) in &streams {
+        check(name, data);
+        check(name, &with_effects(data, &[MbEffect::QpAdd(40), MbEffect::Coeffs(0.0, 8.0), MbEffect::DcShift(200, -200, 200)]));
+    }
+}
+
+/// Deblocking and weighted prediction only rewrite slice headers: they work on CABAC
+/// streams, and switching the PPS flags they need on does not change the other frames.
+#[test]
+fn slice_level_effects_work_on_any_stream() {
+    if !ffmpeg_available() {
+        return;
+    }
+    for extra in [&[][..], &["-coder", "0"]] {
+        let data = mosh_friendly("testsrc2", 2, extra);
+        let (orig, _) = decode(&data, "slice_fx_orig.264");
+        let src = Source::new(Stream::parse(&data).unwrap());
+        let mut timeline = Timeline::identity(src.len());
+        for e in &mut timeline.entries[10..20] {
+            e.effects = vec![MbEffect::Weight(1.2, 6).into(), MbEffect::Tint(4, -4).into()];
+        }
+        for e in &mut timeline.entries[30..40] {
+            e.effects = vec![MbEffect::Deblock(6, 6).into()];
+        }
+        let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+        assert!(rep.failed_effects.is_empty(), "{:?}", rep.failed_effects);
+        let bytes = out.write(false).unwrap();
+        let (md5, err) = decode(&bytes, "slice_fx.264");
+        assert!(err.is_empty(), "{extra:?}: {err}");
+        assert_eq!(md5[..10], orig[..10], "{extra:?}: frames without effects changed");
+        assert_ne!(md5[10], orig[10]);
+        // the drift lasts until the next keyframe (25)
+        assert_ne!(md5[24], orig[24]);
+        assert_eq!(md5[25..30], orig[25..30]);
+        assert_ne!(md5[35], orig[35]);
+        assert_bit_exact(&bytes);
+        let stream = Stream::parse(&bytes).unwrap();
+        for n in &stream.nals {
+            if let NalKind::Pps(p) = &n.kind {
+                assert!(p.weighted_pred_flag && p.deblocking_filter_control_present_flag);
+            }
+        }
+    }
+}
+
+/// With several reference frames, a frame moved next to a keyframe may refer to more
+/// frames than there are; the reference list is filled up, so the stream stays valid.
+#[test]
+fn multi_reference_streams_survive_frame_edits() {
+    if !ffmpeg_available() {
+        return;
+    }
+    for extra in [&["-coder", "0"][..], &[]] {
+        let mut args = vec!["-pix_fmt", "yuv420p", "-bf", "0", "-refs", "3", "-x264-params", "weightp=0:scenecut=0", "-g", "25"];
+        args.extend_from_slice(extra);
+        let data = encode("mandelbrot", 2, &args);
+        let src = Source::new(Stream::parse(&data).unwrap());
+        // frames 1-9 dropped, frame 40 right after keyframe 25, frame 0 frozen
+        let order: Vec<usize> = [0, 0].into_iter().chain(10..25).chain([25, 40]).chain(26..40).chain(41..50).collect();
+        let mut timeline = Timeline { entries: order.iter().map(|&s| TimelineEntry::new(s)).collect() };
+        if extra.is_empty() {
+            // CABAC: frame edits only
+        } else {
+            for e in &mut timeline.entries[3..12] {
+                e.effects = vec![MbEffect::RefShift(2).into()];
+            }
+        }
+        let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+        assert!(rep.failed_effects.is_empty(), "{:?}", rep.failed_effects);
+        let bytes = out.write(false).unwrap();
+        let (md5, err) = decode(&bytes, "multi_ref.264");
+        assert!(err.is_empty(), "{extra:?}: {err}");
+        assert_eq!(md5.len(), order.len());
+        let aus = group_access_units(Stream::parse(&bytes).unwrap().nals);
+        assert!(verify::frame_num_violations(&aus).is_empty());
+    }
+}
+
+/// Macroblocks copied from another frame show up, also intra ones in a keyframe; a
+/// frame that cannot be copied from fails only the frames that use it.
+#[test]
+fn transplant_copies_macroblocks() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let data = mosh_friendly("mandelbrot", 2, &["-coder", "0"]);
+    let (orig, _) = decode(&data, "transplant_orig.264");
+    let src = Source::new(Stream::parse(&data).unwrap());
+    let mut timeline = Timeline::identity(src.len());
+    timeline.entries[0].effects = vec![MbEffect::Transplant(25, 1.0).into()];
+    timeline.entries[10].effects = vec![MbEffect::Transplant(40, 0.5).into()];
+    timeline.entries[30].effects = vec![MbEffect::Transplant(999, 1.0).into()];
+    let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+    assert_eq!(rep.failed_effects.iter().map(|f| f.0).collect::<Vec<_>>(), [30], "{:?}", rep.failed_effects);
+    let (md5, err) = decode(&out.write(false).unwrap(), "transplant.264");
+    assert!(err.is_empty(), "{err}");
+    // keyframe 25 copied over keyframe 0 entirely
+    assert_eq!(md5[0], orig[25]);
+    assert_ne!(md5[10], orig[10]);
+}
+
+#[test]
+fn prep_can_use_several_reference_frames() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let clip = tmp("prep_refs_in.mp4");
+    let status = Command::new(ffmpeg())
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "mandelbrot=size=320x192:rate=25", "-t", "1", "-c:v", "libx264"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let enc = EncodeSettings {
+        preset: "ultrafast".into(),
+        crf: 23.0,
+        keyint: "250".into(),
+        scenecut: true,
+        cavlc: true,
+        refs: 3,
+        x264_params: None,
+    };
+    let out = tmp("prep_refs_out.264");
+    prep(&Tools::find(None), &[clip], &out, None, None, &enc, &mut |_| true).unwrap();
+    let stream = Stream::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let sps = stream.nals.iter().find_map(|n| n.slice()).unwrap().sps.clone();
+    assert_eq!(sps.max_num_ref_frames, 3);
+    let used = stream.nals.iter().filter_map(|n| n.slice()).any(|s| s.header.num_ref_idx_l0_active_minus1 == 2);
+    assert!(used);
 }

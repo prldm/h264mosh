@@ -201,14 +201,17 @@ pub struct EncodeSettings {
     pub keyint: String,
     pub scenecut: bool,
     pub cavlc: bool,
+    /// reference frames (1 is the most mosh-friendly; more make reference effects possible)
+    pub refs: u32,
     /// extra libx264 options, x264-params syntax (key=value:key=value)
     pub x264_params: Option<String>,
 }
 
 impl EncodeSettings {
     fn x264_params(&self) -> String {
-        // mosh-friendly: no reordering, one reference, no weighted prediction
-        let mut p = vec!["bframes=0".to_string(), "ref=1".into(), "weightp=0".into(), format!("keyint={}", self.keyint)];
+        // mosh-friendly: no reordering, one reference (unless asked), no weighted prediction
+        let mut p =
+            vec!["bframes=0".to_string(), format!("ref={}", self.refs.max(1)), "weightp=0".into(), format!("keyint={}", self.keyint)];
         if !self.scenecut {
             p.push("scenecut=0".into());
         }

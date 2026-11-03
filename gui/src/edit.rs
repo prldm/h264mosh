@@ -8,7 +8,7 @@
 //! Effects are instances with parameters (one lane each). A card carries the ids of
 //! the effects it gets, so a moved card takes its effects along.
 
-use h264mosh::effects::MbEffect;
+use h264mosh::effects::{Fx, MbEffect};
 use h264mosh::mosh::{Timeline, TimelineEntry, entry_seed};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -330,7 +330,11 @@ impl Cards {
             for _ in 0..look.shown {
                 let n = occurrences.entry(card.src).or_default();
                 *n += 1;
-                entries.push(TimelineEntry { src: card.src, effects: look.effects.clone(), seed: entry_seed(self.seed, card.src, *n - 1) });
+                entries.push(TimelineEntry {
+                    src: card.src,
+                    effects: look.effects.iter().cloned().map(Fx::from).collect(),
+                    seed: entry_seed(self.seed, card.src, *n - 1),
+                });
             }
             looks.insert(card.id, look);
         }
@@ -492,7 +496,8 @@ mod tests {
         // moving card 2 to the end takes its effect along
         c.move_to(&ids(&[2]), c.len());
         let (tl, _) = c.timeline();
-        let fx: Vec<(usize, Vec<MbEffect>)> = tl.entries.iter().map(|e| (e.src, e.effects.clone())).collect();
+        let fx: Vec<(usize, Vec<MbEffect>)> =
+            tl.entries.iter().map(|e| (e.src, e.effects.iter().map(|x| x.effect.clone()).collect())).collect();
         assert_eq!(fx[5], (2, vec![MbEffect::MvScale(2.0, 2.0)]));
         assert_eq!(fx[2], (3, vec![MbEffect::MvScale(2.0, 2.0), MbEffect::KillIntra]), "lane order");
         render(&mut c);

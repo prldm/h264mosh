@@ -262,11 +262,12 @@ impl<'a> MbContext<'a> {
         Ok(Self { sps, pps, header, slice_type, width, pic_size: width * height, chroma_array_type: sps.chroma_array_type() })
     }
 
-    fn qp_bd_offset(&self) -> i32 {
+    pub fn qp_bd_offset(&self) -> i32 {
         6 * self.sps.bit_depth_luma_minus8 as i32
     }
 
-    fn slice_qp(&self) -> i32 {
+    /// SliceQPY
+    pub fn slice_qp(&self) -> i32 {
         26 + self.pps.pic_init_qp_minus26 + self.header.slice_qp_delta
     }
 

@@ -16,7 +16,7 @@ pub struct MbMotion {
 }
 
 impl MbMotion {
-    const INTRA: MbMotion = MbMotion { mv: [[0; 2]; 16], ref_idx: [-1; 16] };
+    pub const INTRA: MbMotion = MbMotion { mv: [[0; 2]; 16], ref_idx: [-1; 16] };
 
     pub fn is_intra(&self) -> bool {
         self.ref_idx[0] < 0

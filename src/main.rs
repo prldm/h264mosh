@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use h264mosh::effects::MbEffect;
+use h264mosh::effects::{Mask, MbEffect};
 use h264mosh::mb::{self, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, decode_pocs, mosh};
 use h264mosh::motion;
@@ -32,6 +32,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// parsed once; the effect options make `Mosh` large
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Encode clips with mosh-friendly settings (ffmpeg/libx264) and join them into one raw stream
@@ -59,6 +61,9 @@ enum Cmd {
         /// CAVLC instead of CABAC entropy coding
         #[arg(long)]
         cavlc: bool,
+        /// reference frames per P-frame (more than 1 for --ref-shift)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=16))]
+        refs: u32,
         /// extra libx264 options in x264-params syntax, e.g. "deblock=0:me=dia"
         #[arg(long, value_name = "K=V:K=V")]
         x264_params: Option<String>,
@@ -121,8 +126,8 @@ enum Cmd {
     },
 }
 
-/// Macroblock effects (need a CAVLC stream: `prep --cavlc`). Motion vector effects
-/// apply to P-frames.
+/// Macroblock effects (need a CAVLC stream: `prep --cavlc`; --deblock, --weight and
+/// --tint work on any stream). Motion vector effects apply to P-frames.
 #[derive(Args)]
 struct FxArgs {
     /// multiply motion vectors by X (or X:Y)
@@ -143,10 +148,55 @@ struct FxArgs {
     /// drop all residual data (pictures from prediction only)
     #[arg(long)]
     zero_residual: bool,
+    /// set every intra prediction direction: 0 vertical, 1 horizontal, 2 DC, 3-8 diagonal
+    #[arg(long, value_name = "DIR", value_parser = clap::value_parser!(u8).range(0..=8))]
+    intra_mode: Option<u8>,
+    /// turn intra prediction directions by N steps of 22.5 degrees
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    intra_rotate: Option<i32>,
+    /// give a fraction (0-1) of the intra blocks random directions
+    #[arg(long, value_name = "FRACTION")]
+    intra_random: Option<f32>,
+    /// code every intra 4x4/8x8 direction as the value N (0-7); the change cascades through prediction
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7))]
+    intra_cascade: Option<u8>,
+    /// copy macroblocks of input frame FRAME into the same places, a fraction of them (default 1)
+    #[arg(long, value_name = "FRAME[:FRACTION]", value_parser = parse_transplant)]
+    transplant: Option<(usize, f32)>,
+    /// predict from reference frames N frames further back (needs `prep --refs`)
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    ref_shift: Option<i32>,
+    /// add N to the quantizer: the residual is scaled by 2^(N/6)
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    qp_add: Option<i32>,
+    /// set the quantizer to N
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    qp_set: Option<i32>,
+    /// multiply transform coefficients by FACTOR, from frequency FROM (0-1, default 0: all) on
+    #[arg(long, value_name = "FACTOR[:FROM]", value_parser = parse_coeff_scale, allow_hyphen_values = true)]
+    coeff_scale: Option<(f32, f32)>,
+    /// add to the DC level of every block of luma (and Cb, Cr)
+    #[arg(long, value_name = "Y[:CB:CR]", value_parser = parse_dc_shift, allow_hyphen_values = true)]
+    dc_shift: Option<[i32; 3]>,
+    /// deblocking filter offsets ALPHA:BETA (-6 to 6, in steps of 2 of the filter offset)
+    #[arg(long, value_name = "ALPHA:BETA", value_parser = parse_i32_pair, allow_hyphen_values = true)]
+    deblock: Option<(i32, i32)>,
+    /// weighted prediction of P-frames: luma GAIN and OFFSET; accumulates from frame to frame
+    #[arg(long, value_name = "GAIN[:OFFSET]", value_parser = parse_weight, allow_hyphen_values = true)]
+    weight: Option<(f32, i32)>,
+    /// weighted prediction offsets of Cb and Cr in P-frames: the colours drift
+    #[arg(long, value_name = "CB:CR", value_parser = parse_i32_pair, allow_hyphen_values = true)]
+    tint: Option<(i32, i32)>,
     /// frames the macroblock effects apply to (default: all)
     #[arg(long, value_name = "FRAMES")]
     fx_frames: Option<RangeSet>,
-    /// seed for --mv-jitter
+    /// limit the macroblock effects to a rectangle X,Y,W,H in pixels
+    #[arg(long, value_name = "X,Y,W,H", value_parser = parse_rect)]
+    fx_region: Option<[u32; 4]>,
+    /// apply the macroblock effects outside --fx-region instead
+    #[arg(long, requires = "fx_region")]
+    fx_region_invert: bool,
+    /// seed for --mv-jitter, --intra-random and --transplant with a fraction
     #[arg(long, default_value_t = 1)]
     seed: u64,
     /// debug: code skipped macroblocks explicitly (must not change the picture)
@@ -185,7 +235,102 @@ impl FxArgs {
         if let Some((x, y)) = self.mvd_scale {
             fx.push(MbEffect::MvdScale(x, y));
         }
+        if let Some((frame, amount)) = self.transplant {
+            fx.push(MbEffect::Transplant(frame, amount));
+        }
+        if let Some(n) = self.ref_shift {
+            fx.push(MbEffect::RefShift(n));
+        }
+        if let Some(d) = self.intra_mode {
+            fx.push(MbEffect::IntraMode(d));
+        }
+        if let Some(n) = self.intra_rotate {
+            fx.push(MbEffect::IntraRotate(n));
+        }
+        if let Some(p) = self.intra_random {
+            fx.push(MbEffect::IntraRandom(p));
+        }
+        if let Some(n) = self.intra_cascade {
+            fx.push(MbEffect::IntraCascade(n));
+        }
+        if let Some(n) = self.qp_add {
+            fx.push(MbEffect::QpAdd(n));
+        }
+        if let Some(n) = self.qp_set {
+            fx.push(MbEffect::QpSet(n));
+        }
+        if let Some((factor, from)) = self.coeff_scale {
+            fx.push(MbEffect::Coeffs(from, factor));
+        }
+        if let Some([y, cb, cr]) = self.dc_shift {
+            fx.push(MbEffect::DcShift(y, cb, cr));
+        }
+        if let Some((a, b)) = self.deblock {
+            fx.push(MbEffect::Deblock(a, b));
+        }
+        if let Some((gain, offset)) = self.weight {
+            fx.push(MbEffect::Weight(gain, offset));
+        }
+        if let Some((cb, cr)) = self.tint {
+            fx.push(MbEffect::Tint(cb, cr));
+        }
         fx
+    }
+
+    /// --fx-region as a mask, for a picture of `size` pixels.
+    fn mask(&self, (w, h): (u32, u32)) -> Option<Mask> {
+        let [x, y, rw, rh] = self.fx_region?;
+        let (w, h) = (w as f32, h as f32);
+        Some(Mask { rects: vec![[x as f32 / w, y as f32 / h, rw as f32 / w, rh as f32 / h]], invert: self.fx_region_invert })
+    }
+}
+
+/// "FACTOR" (from frequency 0) or "FACTOR:FROM"
+fn parse_coeff_scale(s: &str) -> Result<(f32, f32)> {
+    Ok(match s.split_once(':') {
+        Some((x, from)) => (x.trim().parse()?, from.trim().parse()?),
+        None => (s.trim().parse()?, 0.0),
+    })
+}
+
+/// "A:B"
+fn parse_i32_pair(s: &str) -> Result<(i32, i32)> {
+    let (a, b) = s.split_once(':').context("expected A:B")?;
+    Ok((a.trim().parse()?, b.trim().parse()?))
+}
+
+/// "GAIN" or "GAIN:OFFSET"
+fn parse_weight(s: &str) -> Result<(f32, i32)> {
+    Ok(match s.split_once(':') {
+        Some((g, o)) => (g.trim().parse()?, o.trim().parse()?),
+        None => (s.trim().parse()?, 0),
+    })
+}
+
+/// "FRAME" or "FRAME:FRACTION"
+fn parse_transplant(s: &str) -> Result<(usize, f32)> {
+    Ok(match s.split_once(':') {
+        Some((f, a)) => (f.trim().parse()?, a.trim().parse()?),
+        None => (s.trim().parse()?, 1.0),
+    })
+}
+
+/// "Y" or "Y:CB:CR"
+fn parse_dc_shift(s: &str) -> Result<[i32; 3]> {
+    let v: Vec<i32> = s.split(':').map(|p| p.trim().parse()).collect::<Result<_, _>>()?;
+    match v[..] {
+        [y] => Ok([y, 0, 0]),
+        [y, cb, cr] => Ok([y, cb, cr]),
+        _ => bail!("expected Y or Y:CB:CR"),
+    }
+}
+
+/// "X,Y,W,H"
+fn parse_rect(s: &str) -> Result<[u32; 4]> {
+    let v: Vec<u32> = s.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>()?;
+    match v[..] {
+        [x, y, w, h] if w > 0 && h > 0 => Ok([x, y, w, h]),
+        _ => bail!("expected X,Y,W,H with a non-zero size"),
     }
 }
 
@@ -428,8 +573,12 @@ fn cmd_roundtrip(tools: &Tools, input: &Path, output: Option<&PathBuf>, mb: bool
     Ok(())
 }
 
-fn cmd_mosh(tools: &Tools, input: &Path, output: &Path, plan: MoshPlan) -> Result<()> {
+fn cmd_mosh(tools: &Tools, input: &Path, output: &Path, mut plan: MoshPlan, fx: &FxArgs) -> Result<()> {
     let (_, stream) = load(tools, input)?;
+    if fx.fx_region.is_some() {
+        let size = stream.nals.iter().find_map(|n| n.slice()).map(|s| s.sps.size()).context("the stream has no slices")?;
+        plan.mask = fx.mask(size);
+    }
     let (out, rep) = mosh(stream, &plan)?;
     std::fs::write(output, out.write(false)?).with_context(|| format!("writing {}", output.display()))?;
     print_warnings(&rep.warnings);
@@ -465,8 +614,8 @@ fn main() -> Result<()> {
     }
     let tools = Tools::find(cli.ffmpeg.as_deref());
     match cli.cmd {
-        Cmd::Prep { inputs, output, size, fps, crf, preset, keyint, no_scenecut, cavlc, x264_params } => {
-            let enc = EncodeSettings { preset, crf, keyint, scenecut: !no_scenecut, cavlc, x264_params };
+        Cmd::Prep { inputs, output, size, fps, crf, preset, keyint, no_scenecut, cavlc, refs, x264_params } => {
+            let enc = EncodeSettings { preset, crf, keyint, scenecut: !no_scenecut, cavlc, refs, x264_params };
             let clips = pipeline::prep(&tools, &inputs, &output, size, fps, &enc, &mut |p| {
                 match p {
                     PrepProgress::Start { width, height, fps, clips } => {
@@ -496,13 +645,14 @@ fn main() -> Result<()> {
                 dup,
                 effects: fx.effects(),
                 effect_frames: fx.fx_frames.clone(),
+                mask: None,
                 no_deblock,
                 seed: fx.seed,
             };
             if !plan.no_deblock && plan.drop_keyframes.is_none() && plan.drop.is_none() && plan.dup.is_empty() && plan.effects.is_empty() {
                 bail!("nothing to do: give frame edits (--drop-keyframes, --drop, --dup), effects or --no-deblock");
             }
-            cmd_mosh(&tools, &input, &output, plan)?;
+            cmd_mosh(&tools, &input, &output, plan, &fx)?;
         }
         Cmd::Render { input, output, fps, crf, preset } => {
             let data = std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;

@@ -59,7 +59,7 @@ pub fn effect_name(e: &MbEffect) -> String {
         MbEffect::MvdScale(..) => tr!("effect-mvd-scale"),
         MbEffect::KillIntra => tr!("effect-kill-intra"),
         MbEffect::ZeroResidual => tr!("effect-zero-residual"),
-        MbEffect::ExplicitSkips | MbEffect::SplitTo8x8 => tr!("effect-debug"),
+        _ => tr!("effect-debug"),
     }
 }
 
@@ -71,7 +71,7 @@ fn effect_about(e: &MbEffect) -> String {
         MbEffect::MvdScale(..) => tr!("effect-mvd-scale-about"),
         MbEffect::KillIntra => tr!("effect-kill-intra-about"),
         MbEffect::ZeroResidual => tr!("effect-zero-residual-about"),
-        MbEffect::ExplicitSkips | MbEffect::SplitTo8x8 => tr!("effect-debug"),
+        _ => tr!("effect-debug"),
     }
 }
 

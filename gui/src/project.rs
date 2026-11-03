@@ -53,6 +53,7 @@ impl Encoding {
             keyint: self.keyint.clone(),
             scenecut: self.scenecut,
             cavlc: self.cavlc,
+            refs: 1,
             x264_params: None,
         }
     }

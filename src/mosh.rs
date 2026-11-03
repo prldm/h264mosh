@@ -8,18 +8,18 @@
 //! [`MoshPlan`] is the range-based description used by the command line; it is
 //! compiled into a timeline.
 
-use crate::effects::{self, EffectStats, MbEffect};
+use crate::effects::{self, Donor, Donors, EffectStats, Fx, Mask, MbEffect, PpsNeeds};
 use crate::mb::MbContext;
 use crate::nal::{NAL_IDR, NAL_PPS, NAL_SPS, NalHeader, START_CODE};
 use crate::poc::PocDecoder;
 use crate::pps::Pps;
 use crate::range::{DupSpec, RangeSet};
-use crate::slice::DecRefPicMarking;
+use crate::slice::{DecRefPicMarking, RplmOp, SliceType};
 use crate::sps::Sps;
 use crate::stream::{AccessUnit, Nal, NalKind, Stream, group_access_units};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -54,7 +54,7 @@ impl Source {
 pub struct TimelineEntry {
     /// input frame index (decode order)
     pub src: usize,
-    pub effects: Vec<MbEffect>,
+    pub effects: Vec<Fx>,
     /// seed of randomized effects; belongs to the entry, so editing other parts of the
     /// timeline never changes this frame
     pub seed: u64,
@@ -177,11 +177,16 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
         renumber(&mut out);
     }
     // stream-level preconditions (e.g. CABAC) fail the whole render, not every frame
-    if let Some((f, _)) = out.iter().zip(&timeline.entries).find(|(_, e)| !e.effects.is_empty())
+    if let Some((f, _)) = out.iter().zip(&timeline.entries).find(|(_, e)| e.effects.iter().any(|x| x.effect.needs_macroblocks()))
         && let Some(s) = f.au.first_slice()
     {
         MbContext::new(s)?;
     }
+    let needs = timeline.entries.iter().flat_map(|e| &e.effects).fold(PpsNeeds::default(), |n, x| n.union(x.effect.pps_needs()));
+    if needs.any() {
+        upgrade_pps(&mut out, needs);
+    }
+    let donors = donors(src, timeline);
     // frames are independent at the bitstream level: apply effects in parallel; seeds
     // belong to the entries, so the result does not depend on scheduling
     let results: Vec<_> = out
@@ -189,7 +194,7 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
         .zip(timeline.entries.par_iter())
         .enumerate()
         .filter(|(_, (_, e))| !e.effects.is_empty())
-        .map(|(k, (f, e))| (k, apply_frame_effects(&f.au, &e.effects, e.seed)))
+        .map(|(k, (f, e))| (k, apply_frame_effects(&f.au, &e.effects, e.seed, &donors)))
         .collect();
     for (k, result) in results {
         match result {
@@ -248,13 +253,13 @@ pub fn segment(stream: &Stream, frames: &[RenderedFrame], range: Range<usize>) -
 
 /// Apply effects to every slice of a copy of the frame; all or nothing. Errors and
 /// panics are reported instead of aborting the render.
-fn apply_frame_effects(au: &AccessUnit, fx: &[MbEffect], seed: u64) -> std::result::Result<(AccessUnit, EffectStats), String> {
+fn apply_frame_effects(au: &AccessUnit, fx: &[Fx], seed: u64, donors: &Donors) -> std::result::Result<(AccessUnit, EffectStats), String> {
     let run = || -> Result<(AccessUnit, EffectStats)> {
         let mut au = au.clone();
         let mut stats = EffectStats::default();
         for (i, n) in au.nals.iter_mut().enumerate() {
             if let NalKind::Slice(s) = &mut n.kind {
-                stats += effects::apply(s, fx, splitmix64(seed ^ i as u64))?;
+                stats += effects::apply(s, fx, splitmix64(seed ^ i as u64), donors)?;
                 n.dirty = true;
             }
         }
@@ -268,6 +273,29 @@ fn apply_frame_effects(au: &AccessUnit, fx: &[MbEffect], seed: u64) -> std::resu
             Err(format!("internal error: {}", msg.unwrap_or_else(|| "panic".into())))
         }
     }
+}
+
+/// The input frames that macroblocks are copied from, parsed once for all frames.
+fn donors(src: &Source, timeline: &Timeline) -> Donors {
+    let frames: BTreeSet<usize> = timeline
+        .entries
+        .iter()
+        .flat_map(|e| &e.effects)
+        .filter_map(|x| match x.effect {
+            MbEffect::Transplant(from, _) => Some(from),
+            _ => None,
+        })
+        .collect();
+    frames
+        .into_par_iter()
+        .map(|i| {
+            let donor = match src.aus.get(i) {
+                Some(au) => Donor::new(au).map_err(|e| format!("{e:#}")),
+                None => Err(format!("the input has {} frames", src.len())),
+            };
+            (i, donor)
+        })
+        .collect()
 }
 
 pub fn decode_pocs(aus: &[AccessUnit]) -> Vec<Option<i64>> {
@@ -382,6 +410,8 @@ fn renumber(out: &mut [OutFrame]) {
     let mut prev_src: Option<(usize, i64)> = None;
     let mut last_step = 2i64;
     let mut prev_idr_pic_id: Option<u32> = None;
+    // short-term reference frames a decoder holds after the previous frame (frame_num, oldest first)
+    let mut dpb: Vec<u32> = Vec::new();
     for f in out.iter_mut() {
         let Some(first) = f.au.first_slice() else { continue };
         let sps = first.sps.clone();
@@ -410,6 +440,9 @@ fn renumber(out: &mut [OutFrame]) {
         prev_idr_pic_id = idr.then_some(idr_pic_id);
         let frame_num = if idr { 0 } else { (prev_ref_frame_num + 1) % sps.max_frame_num() };
         let poc_lsb = poc.rem_euclid(sps.max_poc_lsb() as i64) as u32;
+        if idr {
+            dpb.clear();
+        }
         for n in f.au.nals.iter_mut() {
             let Some(s) = n.slice_mut() else { continue };
             let h = &mut s.header;
@@ -426,48 +459,128 @@ fn renumber(out: &mut [OutFrame]) {
                 h.idr_pic_id = idr_pic_id;
                 changed = true;
             }
+            // a moved frame may use more reference indices than there are frames to
+            // refer to, or modify its list with pictures that are not there
+            let active = h.num_ref_idx_l0_active_minus1 as usize + 1;
+            if matches!(h.slice_type(), SliceType::P | SliceType::SP)
+                && !dpb.is_empty()
+                && !ref_list_complete(&dpb, h.rplm_l0.as_deref(), frame_num, active, sps.max_frame_num())
+            {
+                h.rplm_l0 = (active > dpb.len()).then(|| fill_ref_list(&dpb, frame_num, active, sps.max_frame_num()));
+                changed = true;
+            }
             n.dirty |= changed;
         }
         if is_ref && !idr {
             prev_ref_frame_num = frame_num;
         }
+        if is_ref {
+            if dpb.len() >= sps.max_num_ref_frames.max(1) as usize {
+                dpb.remove(0);
+            }
+            dpb.push(frame_num);
+        }
         if mmco5 {
             prev_ref_frame_num = 0;
             poc = 0;
+            dpb = vec![0];
+        }
+    }
+}
+
+/// Whether the reference list of a P frame (8.2.4.2.1, modified by `ops` as in
+/// 8.2.4.3.1) has a picture for each of its `active` entries when the decoder holds
+/// the short-term frames `dpb` (frame_num, oldest first). Lists with long-term
+/// pictures are not checked.
+fn ref_list_complete(dpb: &[u32], ops: Option<&[RplmOp]>, frame_num: u32, active: usize, max_frame_num: u32) -> bool {
+    let mut list: Vec<Option<u32>> = dpb.iter().rev().map(|&f| Some(f)).take(active).collect();
+    list.resize(active, None);
+    let mut pred = frame_num;
+    for (i, &(idc, v)) in ops.unwrap_or_default().iter().enumerate() {
+        let pic = match idc {
+            _ if v >= max_frame_num => return false,
+            0 => (pred + max_frame_num - (v + 1)) % max_frame_num,
+            1 => (pred + v + 1) % max_frame_num,
+            _ => return true,
+        };
+        if !dpb.contains(&pic) || i >= active {
+            return false;
+        }
+        pred = pic;
+        // insert at index i, drop the later copies of the same picture
+        list.insert(i, Some(pic));
+        let rest: Vec<_> = list.drain(i + 1..).filter(|&p| p != Some(pic)).collect();
+        list.extend(rest);
+        list.resize(active, None);
+    }
+    list.iter().all(Option::is_some)
+}
+
+/// ref_pic_list_modification for a P slice that uses `active` reference indices while
+/// the decoder holds only the frames `dpb` (frame_num, oldest first): the list in its
+/// initial order (most recent first), the missing entries repeating the oldest frame.
+fn fill_ref_list(dpb: &[u32], frame_num: u32, active: usize, max_frame_num: u32) -> Vec<RplmOp> {
+    let mut pred = frame_num;
+    (0..active)
+        .map(|i| {
+            let pic = dpb[dpb.len() - 1 - i.min(dpb.len() - 1)];
+            // a difference of MaxPicNum wraps around to the same picture
+            let diff = (pred + max_frame_num - pic) % max_frame_num;
+            pred = pic;
+            (0, if diff == 0 { max_frame_num } else { diff } - 1)
+        })
+        .collect()
+}
+
+/// Switch PPS flags on in the whole stream (`needs`); slices referring to a changed
+/// PPS are re-serialized against the new one. P slices that get weighted prediction
+/// get a table with default weights, so they decode as before.
+fn upgrade_pps(out: &mut [OutFrame], needs: PpsNeeds) {
+    // the old Arc is kept in the map so its address cannot be reused while we key on it
+    let mut replaced: HashMap<*const Pps, (Arc<Pps>, Arc<Pps>)> = HashMap::new();
+    let mut upgrade = |pps: &Arc<Pps>| -> Arc<Pps> {
+        let Some(new) = needs.upgrade(pps) else { return pps.clone() };
+        replaced.entry(Arc::as_ptr(pps)).or_insert_with(|| (pps.clone(), Arc::new(new))).1.clone()
+    };
+    for f in out.iter_mut() {
+        for n in f.au.nals.iter_mut() {
+            match &mut n.kind {
+                NalKind::Pps(p) => {
+                    let new = upgrade(p);
+                    if !Arc::ptr_eq(p, &new) {
+                        *p = new;
+                        n.dirty = true;
+                    }
+                }
+                NalKind::Slice(s) => {
+                    let new = upgrade(&s.pps);
+                    if !Arc::ptr_eq(&s.pps, &new) {
+                        s.pps = new;
+                        n.dirty = true;
+                    }
+                    if s.pps.weighted_pred_flag
+                        && s.header.pred_weight_table.is_none()
+                        && matches!(s.header.slice_type(), SliceType::P | SliceType::SP)
+                    {
+                        s.header.pred_weight_table = Some(effects::default_weights(s));
+                        n.dirty = true;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
 
 fn disable_deblocking(out: &mut [OutFrame]) {
-    // PPSs that don't allow per-slice deblocking control get the flag switched on;
-    // slices referring to them are re-serialized against the new PPS.
-    // the old Arc is kept in the map so its address cannot be reused while we key on it
-    let mut replaced: HashMap<*const Pps, (Arc<Pps>, Arc<Pps>)> = HashMap::new();
-    let mut upgrade = |pps: &Arc<Pps>| -> Arc<Pps> {
-        if pps.deblocking_filter_control_present_flag {
-            return pps.clone();
-        }
-        let new = Arc::new(Pps { deblocking_filter_control_present_flag: true, ..(**pps).clone() });
-        replaced.entry(Arc::as_ptr(pps)).or_insert_with(|| (pps.clone(), new)).1.clone()
-    };
+    upgrade_pps(out, PpsNeeds { deblocking_control: true, weighted_pred: false });
     for f in out.iter_mut() {
         for n in f.au.nals.iter_mut() {
-            match &mut n.kind {
-                NalKind::Pps(p) if !p.deblocking_filter_control_present_flag => {
-                    *p = upgrade(p);
-                    n.dirty = true;
-                }
-                NalKind::Slice(s) => {
-                    if !Arc::ptr_eq(&s.pps, &upgrade(&s.pps)) {
-                        s.pps = upgrade(&s.pps);
-                        n.dirty = true;
-                    }
-                    if s.header.disable_deblocking_filter_idc != 1 {
-                        s.header.disable_deblocking_filter_idc = 1;
-                        n.dirty = true;
-                    }
-                }
-                _ => {}
+            if let NalKind::Slice(s) = &mut n.kind
+                && s.header.disable_deblocking_filter_idc != 1
+            {
+                s.header.disable_deblocking_filter_idc = 1;
+                n.dirty = true;
             }
         }
     }
@@ -481,9 +594,10 @@ pub struct MoshPlan {
     /// drop any frame whose index is in the set
     pub drop: Option<RangeSet>,
     pub dup: Vec<DupSpec>,
-    /// macroblock effects, applied to `effect_frames` (all frames if None)
+    /// macroblock effects, applied to `effect_frames` (all frames if None), within `mask`
     pub effects: Vec<MbEffect>,
     pub effect_frames: Option<RangeSet>,
+    pub mask: Option<Mask>,
     pub no_deblock: bool,
     pub seed: u64,
 }
@@ -512,7 +626,11 @@ impl MoshPlan {
                 report.dropped.push(i);
                 continue;
             }
-            let effects = if self.effect_frames.as_ref().is_none_or(|r| r.contains(i)) { self.effects.clone() } else { Vec::new() };
+            let effects: Vec<Fx> = if self.effect_frames.as_ref().is_none_or(|r| r.contains(i)) {
+                self.effects.iter().map(|e| Fx { effect: e.clone(), mask: self.mask.clone() }).collect()
+            } else {
+                Vec::new()
+            };
             let copies: usize = self.dup.iter().filter(|d| d.frames.contains(i)).map(|d| d.count).sum();
             for copy in 0..=copies {
                 entries.push(TimelineEntry { src: i, effects: effects.clone(), seed: entry_seed(self.seed, i, copy) });
@@ -540,6 +658,34 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn missing_references_repeat_the_oldest_frame() {
+        // frames 6 and 7 held, frame 8 refers to four: 7, 6, 6, 6
+        assert_eq!(fill_ref_list(&[6, 7], 8, 4, 16), [(0, 0), (0, 0), (0, 15), (0, 15)]);
+        // across the frame_num wrap: 15 then 0, current 1
+        assert_eq!(fill_ref_list(&[15, 0], 1, 2, 16), [(0, 0), (0, 0)]);
+        assert_eq!(fill_ref_list(&[14], 2, 2, 16), [(0, 3), (0, 15)]);
+        for (dpb, cur, active) in [(&[6, 7][..], 8, 4), (&[15, 0], 1, 3), (&[14], 2, 2)] {
+            assert!(!ref_list_complete(dpb, None, cur, active, 16));
+            assert!(ref_list_complete(dpb, Some(&fill_ref_list(dpb, cur, active, 16)), cur, active, 16));
+        }
+    }
+
+    #[test]
+    fn reference_lists_are_checked_against_the_held_frames() {
+        // frames 3, 4, 5 held, current 6: the initial list is 5, 4, 3
+        assert!(ref_list_complete(&[3, 4, 5], None, 6, 3, 16));
+        assert!(!ref_list_complete(&[4, 5], None, 6, 3, 16));
+        // move 3 to the front: 3, 5, 4
+        assert!(ref_list_complete(&[3, 4, 5], Some(&[(0, 2)]), 6, 3, 16));
+        // refers to frame 2, which is gone
+        assert!(!ref_list_complete(&[3, 4, 5], Some(&[(0, 3)]), 6, 3, 16));
+        // the same picture twice, then the next one: 5, 5, 4
+        assert!(ref_list_complete(&[4, 5], Some(&[(0, 0), (0, 15), (0, 0)]), 6, 3, 16));
+        // two copies of 5 and nothing for the third entry
+        assert!(!ref_list_complete(&[5], Some(&[(0, 0), (0, 15)]), 6, 3, 16));
+    }
 
     #[test]
     fn edit_model_can_move_to_worker_threads() {
