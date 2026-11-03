@@ -594,6 +594,8 @@ fn new_effects_decode_cleanly() {
         MbEffect::Coeffs(0.0, -1.0),
         MbEffect::DcShift(30, 20, -20),
         MbEffect::Transplant(30, 0.6),
+        MbEffect::MotionTransplant(40, 1.0),
+        MbEffect::MotionTransplant(12, 0.5),
     ];
     for (name, data) in cavlc_configs() {
         let (orig, _) = decode(&data, "new_fx_orig.264");
@@ -631,6 +633,9 @@ fn identity_effects_are_bit_exact() {
         let mut timeline = Timeline::identity(src.len());
         for k in [0, 7, 30] {
             timeline.entries[k].effects = vec![MbEffect::Transplant(k, 1.0).into()];
+        }
+        for k in [8, 31] {
+            timeline.entries[k].effects = vec![MbEffect::MotionTransplant(k, 1.0).into()];
         }
         let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
         assert!(rep.failed_effects.is_empty(), "{:?}", rep.failed_effects);

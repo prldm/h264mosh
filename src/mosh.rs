@@ -282,7 +282,7 @@ fn donors(src: &Source, timeline: &Timeline) -> Donors {
         .iter()
         .flat_map(|e| &e.effects)
         .filter_map(|x| match x.effect {
-            MbEffect::Transplant(from, _) => Some(from),
+            MbEffect::Transplant(from, _) | MbEffect::MotionTransplant(from, _) => Some(from),
             _ => None,
         })
         .collect();

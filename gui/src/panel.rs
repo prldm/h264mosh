@@ -63,6 +63,7 @@ fn groups() -> [(String, Vec<MbEffect>); 5] {
                 MbEffect::MvAdd(16, 0),
                 MbEffect::MvJitter(16),
                 MbEffect::MvdScale(2.0, 2.0),
+                MbEffect::MotionTransplant(0, 1.0),
                 MbEffect::RefShift(1),
             ],
         ),
@@ -83,6 +84,7 @@ pub fn effect_name(e: &MbEffect) -> String {
         MbEffect::KillIntra => tr!("effect-kill-intra"),
         MbEffect::ZeroResidual => tr!("effect-zero-residual"),
         MbEffect::Transplant(..) => tr!("effect-transplant"),
+        MbEffect::MotionTransplant(..) => tr!("effect-motion-transplant"),
         MbEffect::IntraMode(_) => tr!("effect-intra-mode"),
         MbEffect::IntraRotate(_) => tr!("effect-intra-rotate"),
         MbEffect::IntraRandom(_) => tr!("effect-intra-random"),
@@ -108,6 +110,7 @@ fn effect_about(e: &MbEffect) -> String {
         MbEffect::KillIntra => tr!("effect-kill-intra-about"),
         MbEffect::ZeroResidual => tr!("effect-zero-residual-about"),
         MbEffect::Transplant(..) => tr!("effect-transplant-about"),
+        MbEffect::MotionTransplant(..) => tr!("effect-motion-transplant-about"),
         MbEffect::IntraMode(_) => tr!("effect-intra-mode-about"),
         MbEffect::IntraRotate(_) => tr!("effect-intra-rotate-about"),
         MbEffect::IntraRandom(_) => tr!("effect-intra-random-about"),
@@ -146,7 +149,9 @@ pub fn effect_summary(e: &MbEffect) -> String {
         MbEffect::MvAdd(x, y) => tr!("summary-shift", x = px(x), y = px(y)),
         MbEffect::MvJitter(n) => tr!("summary-jitter", px = px(n)),
         MbEffect::RefShift(n) => tr!("summary-frames", n = format!("{n:+}")),
-        MbEffect::Transplant(frame, amount) => tr!("summary-transplant", frame = frame, percent = amount as f64 * 100.0),
+        MbEffect::Transplant(frame, amount) | MbEffect::MotionTransplant(frame, amount) => {
+            tr!("summary-transplant", frame = frame, percent = amount as f64 * 100.0)
+        }
         MbEffect::IntraMode(d) => direction_name(d),
         MbEffect::IntraRotate(n) => tr!("summary-degrees", degrees = n as f64 * 22.5),
         MbEffect::IntraRandom(p) => tr!("summary-percent", percent = p as f64 * 100.0),
@@ -324,6 +329,10 @@ fn params(ui: &mut egui::Ui, effect: &mut MbEffect, seed: u64, frames: usize, ac
             if *amount < 1.0 {
                 pattern(ui, actions);
             }
+        }
+        MbEffect::MotionTransplant(frame, mix) => {
+            ui.add(egui::DragValue::new(frame).range(0..=frames.saturating_sub(1)).prefix(tr!("param-from-frame")));
+            percent(ui, mix, tr!("param-mix"));
         }
         MbEffect::IntraMode(d) => {
             egui::ComboBox::from_label(tr!("param-direction")).selected_text(direction_name(*d)).show_ui(ui, |ui| {

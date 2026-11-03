@@ -163,6 +163,9 @@ struct FxArgs {
     /// copy macroblocks of input frame FRAME into the same places, a fraction of them (default 1)
     #[arg(long, value_name = "FRAME[:FRACTION]", value_parser = parse_transplant)]
     transplant: Option<(usize, f32)>,
+    /// give P-frames the motion of input frame FRAME, mixed with their own (default 1: all of it)
+    #[arg(long, value_name = "FRAME[:MIX]", value_parser = parse_transplant)]
+    motion_from: Option<(usize, f32)>,
     /// predict from reference frames N frames further back (needs `prep --refs`)
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     ref_shift: Option<i32>,
@@ -237,6 +240,9 @@ impl FxArgs {
         }
         if let Some((frame, amount)) = self.transplant {
             fx.push(MbEffect::Transplant(frame, amount));
+        }
+        if let Some((frame, mix)) = self.motion_from {
+            fx.push(MbEffect::MotionTransplant(frame, mix));
         }
         if let Some(n) = self.ref_shift {
             fx.push(MbEffect::RefShift(n));

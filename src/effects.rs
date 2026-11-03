@@ -59,6 +59,9 @@ pub enum MbEffect {
     /// Copy macroblocks of another input frame (decode order) into the same places:
     /// (frame, fraction 0..=1 of the macroblocks, chosen at random).
     Transplant(usize, f32),
+    /// Give P-frame macroblocks the motion of another input frame (decode order) at the
+    /// same place, mixed with their own: (frame, 0..=1 how much of the other's).
+    MotionTransplant(usize, f32),
     /// Deblocking filter offsets FilterOffsetA/B in steps of 2 (-6..=6): positive smooths more.
     Deblock(i32, i32),
     /// Weighted prediction of P slices: luma gain and offset. Applied to every
@@ -81,6 +84,7 @@ impl MbEffect {
                 | MbEffect::SplitTo8x8
                 | MbEffect::RefShift(_)
                 | MbEffect::Transplant(..)
+                | MbEffect::MotionTransplant(..)
         )
     }
 
@@ -259,7 +263,8 @@ struct DonorMb {
     intra: Option<MbIntra>,
 }
 
-/// The macroblocks of an input frame, for [`MbEffect::Transplant`].
+/// The macroblocks of an input frame, for [`MbEffect::Transplant`] and
+/// [`MbEffect::MotionTransplant`].
 pub struct Donor {
     sps: Arc<Sps>,
     pps: Arc<Pps>,
@@ -533,18 +538,24 @@ fn apply_to_data(
                     }
                 }
             }
+            MbEffect::MotionTransplant(from, mix) => {
+                let donor = donor(donors, from, ctx)?;
+                let blend = |own: i32, other: i32| own + ((other - own) as f32 * mix.clamp(0.0, 1.0)).round() as i32;
+                for (i, t) in target.iter_mut().enumerate().filter(|(i, _)| inside(fx, *i)) {
+                    let own = t.as_mut().filter(|t| !t.is_intra());
+                    let other = donor.mbs.get(first + i).and_then(|d| d.as_ref()?.motion).filter(|m| !m.is_intra());
+                    if let (Some(t), Some(m)) = (own, other) {
+                        for (mv, d) in t.mv.iter_mut().zip(m.mv) {
+                            *mv = clamp_mv([blend(mv[0], d[0]), blend(mv[1], d[1])], limits);
+                        }
+                    }
+                }
+            }
             MbEffect::Transplant(from, amount) => {
                 if ctx.slice_type == SliceType::B {
                     continue;
                 }
-                let donor = match donors.get(&from) {
-                    Some(Ok(d)) => d,
-                    Some(Err(reason)) => bail!("cannot copy from frame {from}: {reason}"),
-                    None => bail!("frame {from} is not available to copy from"),
-                };
-                if *donor.sps != *ctx.sps || mb_layer(&donor.pps) != mb_layer(ctx.pps) {
-                    bail!("frame {from} is coded with other parameter sets");
-                }
+                let donor = donor(donors, from, ctx)?;
                 let max_ref = ctx.header.num_ref_idx_l0_active_minus1 as u8;
                 for i in 0..data.mbs.len() {
                     // draw for every macroblock, so the choice does not depend on the mask
@@ -630,6 +641,19 @@ fn keep_quantizers(ctx: &MbContext, data: &mut SliceData, slice_qp: i32, qps: &[
         motion::encode_motion(ctx, data, &motion.into_iter().map(Some).collect::<Vec<_>>())?;
     }
     Ok(())
+}
+
+/// The input frame `from`, if its macroblocks fit into slices like `ctx`'s.
+fn donor<'a>(donors: &'a Donors, from: usize, ctx: &MbContext) -> Result<&'a Donor> {
+    let donor = match donors.get(&from) {
+        Some(Ok(d)) => d,
+        Some(Err(reason)) => bail!("cannot copy from frame {from}: {reason}"),
+        None => bail!("frame {from} is not available to copy from"),
+    };
+    if *donor.sps != *ctx.sps || mb_layer(&donor.pps) != mb_layer(ctx.pps) {
+        bail!("frame {from} is coded with other parameter sets");
+    }
+    Ok(donor)
 }
 
 /// Change the directions of the intra macroblocks `pick` selects.
