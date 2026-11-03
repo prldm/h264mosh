@@ -294,6 +294,11 @@ impl Donor {
     }
 }
 
+/// The PPS fields macroblocks depend on (not, e.g., the flags slice-level effects switch on).
+fn mb_layer(p: &Pps) -> impl PartialEq + use<'_> {
+    (p.entropy_coding_mode_flag, p.chroma_qp_index_offset, p.constrained_intra_pred_flag, &p.ext)
+}
+
 /// Input frames to copy macroblocks from, by frame index; an error says why a frame
 /// cannot be used.
 pub type Donors = HashMap<usize, std::result::Result<Donor, String>>;
@@ -537,7 +542,7 @@ fn apply_to_data(
                     Some(Err(reason)) => bail!("cannot copy from frame {from}: {reason}"),
                     None => bail!("frame {from} is not available to copy from"),
                 };
-                if *donor.sps != *ctx.sps || *donor.pps != *ctx.pps {
+                if *donor.sps != *ctx.sps || mb_layer(&donor.pps) != mb_layer(ctx.pps) {
                     bail!("frame {from} is coded with other parameter sets");
                 }
                 let max_ref = ctx.header.num_ref_idx_l0_active_minus1 as u8;

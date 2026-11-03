@@ -834,6 +834,8 @@ fn transplant_copies_macroblocks() {
     timeline.entries[0].effects = vec![MbEffect::Transplant(25, 1.0).into()];
     timeline.entries[10].effects = vec![MbEffect::Transplant(40, 0.5).into()];
     timeline.entries[30].effects = vec![MbEffect::Transplant(999, 1.0).into()];
+    // weighted prediction switched on in the PPS of every frame does not stop it
+    timeline.entries[45].effects = vec![MbEffect::Weight(1.1, 0).into()];
     let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     assert_eq!(rep.failed_effects.iter().map(|f| f.0).collect::<Vec<_>>(), [30], "{:?}", rep.failed_effects);
     let (md5, err) = decode(&out.write(false).unwrap(), "transplant.264");
