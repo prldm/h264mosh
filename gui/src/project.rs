@@ -38,12 +38,19 @@ pub struct Encoding {
     pub keyint: String,
     pub scenecut: bool,
     pub cavlc: bool,
+    /// reference frames
+    #[serde(default = "one")]
+    pub refs: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 impl Encoding {
     /// The `prep` defaults, with CAVLC so that macroblock effects work.
-    fn for_import() -> Self {
-        Self { preset: "medium".into(), crf: 18.0, keyint: "250".into(), scenecut: true, cavlc: true }
+    fn for_import(refs: u32) -> Self {
+        Self { preset: "medium".into(), crf: 18.0, keyint: "250".into(), scenecut: true, cavlc: true, refs: refs.max(1) }
     }
 
     fn settings(&self) -> EncodeSettings {
@@ -53,7 +60,7 @@ impl Encoding {
             keyint: self.keyint.clone(),
             scenecut: self.scenecut,
             cavlc: self.cavlc,
-            refs: 1,
+            refs: self.refs,
             x264_params: None,
         }
     }
@@ -78,6 +85,8 @@ pub struct Project {
     pub fps: String,
     /// CAVLC entropy coding (macroblock effects need it)
     pub cavlc: bool,
+    /// reference frames of the stream (max_num_ref_frames)
+    pub refs: u32,
     pub cards: Cards,
     pub history: History,
     /// the edit state last saved, if any
@@ -263,6 +272,7 @@ fn load(
         size: sps.size(),
         fps,
         cavlc,
+        refs: sps.max_num_ref_frames,
         cards,
         history: History::default(),
         saved: None,
@@ -271,8 +281,8 @@ fn load(
 }
 
 /// Open clips: a single raw H.264 stream is used as it is; anything else is encoded
-/// with mosh-friendly settings into `cache_dir` first.
-pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, r: &Reporter) -> Result<Imported> {
+/// with mosh-friendly settings (and `refs` reference frames) into `cache_dir` first.
+pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, refs: u32, r: &Reporter) -> Result<Imported> {
     let name = inputs.first().map(|p| name_of(p)).unwrap_or_default();
     let project = if let [single] = inputs
         && pipeline::is_raw_h264(single)
@@ -281,7 +291,7 @@ pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, r: &Reporter)
         let data = std::fs::read(single).with_context(|| format!("reading {}", single.display()))?;
         load(name, inputs.to_vec(), single.clone(), None, data, r)?
     } else {
-        let encoding = Encoding::for_import();
+        let encoding = Encoding::for_import(refs);
         let (stream, data) = prepare(tools, inputs, cache_dir, &encoding, r)?;
         load(name, inputs.to_vec(), stream, Some(encoding), data, r)?
     };

@@ -8,7 +8,7 @@
 //! Effects are instances with parameters (one lane each). A card carries the ids of
 //! the effects it gets, so a moved card takes its effects along.
 
-use h264mosh::effects::{Fx, MbEffect};
+use h264mosh::effects::{Fx, Mask, MbEffect};
 use h264mosh::mosh::{Timeline, TimelineEntry, entry_seed};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -56,20 +56,33 @@ impl Card {
     }
 }
 
-/// An effect lane: one effect with its parameters.
+/// An effect lane: one effect with its parameters, and the area it is limited to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Effect {
     pub id: EffectId,
     pub effect: MbEffect,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Mask>,
 }
 
-/// Does `effect` change a frame of this type? Motion effects and kill-intra work on
-/// P-frames only.
+/// Does `effect` change a frame of this type? Motion effects, kill-intra, reference
+/// shifts and weighted prediction work on P-frames only; residual, quantizer, intra and
+/// deblocking effects on any frame.
 pub fn affects(effect: &MbEffect, frame_kind: char) -> bool {
     match effect {
-        MbEffect::ZeroResidual => true,
+        MbEffect::ZeroResidual
+        | MbEffect::Coeffs(..)
+        | MbEffect::DcShift(..)
+        | MbEffect::QpAdd(_)
+        | MbEffect::QpSet(_)
+        | MbEffect::IntraMode(_)
+        | MbEffect::IntraRotate(_)
+        | MbEffect::IntraRandom(_)
+        | MbEffect::IntraCascade(_)
+        | MbEffect::Deblock(..) => true,
         MbEffect::MvdScale(..) => frame_kind != 'I',
+        MbEffect::Transplant(..) => frame_kind != 'B',
         _ => frame_kind == 'P',
     }
 }
@@ -91,7 +104,7 @@ pub struct EditState {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Look {
     shown: u32,
-    effects: Vec<MbEffect>,
+    effects: Vec<Fx>,
     /// the seed, when an effect is randomized
     seed: Option<u64>,
 }
@@ -176,8 +189,12 @@ impl Cards {
     }
 
     /// The effects `card` gets, in the order they are applied.
-    pub fn card_effects(&self, card: &Card) -> Vec<MbEffect> {
-        self.effects.iter().filter(|e| e.enabled && card.effects.contains(&e.id)).map(|e| e.effect.clone()).collect()
+    pub fn card_effects(&self, card: &Card) -> Vec<Fx> {
+        self.effects
+            .iter()
+            .filter(|e| e.enabled && card.effects.contains(&e.id))
+            .map(|e| Fx { effect: e.effect.clone(), mask: e.mask.clone() })
+            .collect()
     }
 
     fn look(&self, card: &Card) -> Look {
@@ -186,7 +203,7 @@ impl Cards {
             return Look::default();
         }
         let effects = self.card_effects(card);
-        let seed = effects.iter().any(|e| matches!(e, MbEffect::MvJitter(_))).then_some(self.seed);
+        let seed = effects.iter().any(|e| e.effect.is_random()).then_some(self.seed);
         Look { shown, effects, seed }
     }
 
@@ -258,7 +275,7 @@ impl Cards {
     /// Add a new effect lane for the cards `ids`.
     pub fn add_effect(&mut self, effect: MbEffect, ids: &HashSet<CardId>) -> EffectId {
         let id = self.effects.iter().map(|e| e.id + 1).max().unwrap_or(1);
-        self.effects.push(Effect { id, effect, enabled: true });
+        self.effects.push(Effect { id, effect, enabled: true, mask: None });
         self.edit(|c| ids.contains(&c.id), |c| c.effects.push(id));
         id
     }
@@ -267,6 +284,14 @@ impl Cards {
     pub fn set_effect(&mut self, id: EffectId, effect: MbEffect) {
         if let Some(e) = self.effects.iter_mut().find(|e| e.id == id) {
             e.effect = effect;
+            self.edit(|c| c.effects.contains(&id), |_| {});
+        }
+    }
+
+    /// Limit an effect to an area of the picture, or not.
+    pub fn set_effect_mask(&mut self, id: EffectId, mask: Option<Mask>) {
+        if let Some(e) = self.effects.iter_mut().find(|e| e.id == id) {
+            e.mask = mask;
             self.edit(|c| c.effects.contains(&id), |_| {});
         }
     }
@@ -310,7 +335,7 @@ impl Cards {
 
     pub fn set_seed(&mut self, seed: u64) {
         self.seed = seed;
-        let random: Vec<EffectId> = self.effects.iter().filter(|e| matches!(e.effect, MbEffect::MvJitter(_))).map(|e| e.id).collect();
+        let random: Vec<EffectId> = self.effects.iter().filter(|e| e.effect.is_random()).map(|e| e.id).collect();
         self.edit(|c| c.effects.iter().any(|e| random.contains(e)), |_| {});
     }
 
@@ -330,11 +355,7 @@ impl Cards {
             for _ in 0..look.shown {
                 let n = occurrences.entry(card.src).or_default();
                 *n += 1;
-                entries.push(TimelineEntry {
-                    src: card.src,
-                    effects: look.effects.iter().cloned().map(Fx::from).collect(),
-                    seed: entry_seed(self.seed, card.src, *n - 1),
-                });
+                entries.push(TimelineEntry { src: card.src, effects: look.effects.clone(), seed: entry_seed(self.seed, card.src, *n - 1) });
             }
             looks.insert(card.id, look);
         }
@@ -522,12 +543,33 @@ mod tests {
 
     #[test]
     fn only_randomized_effects_depend_on_the_seed() {
-        let mut c = Cards::new(4);
+        let mut c = Cards::new(6);
         c.add_effect(MbEffect::MvJitter(8), &ids(&[1]));
         c.add_effect(MbEffect::ZeroResidual, &ids(&[2]));
+        c.add_effect(MbEffect::IntraRandom(0.5), &ids(&[3]));
+        c.add_effect(MbEffect::Transplant(0, 0.5), &ids(&[4]));
+        c.add_effect(MbEffect::Transplant(0, 1.0), &ids(&[5]));
         render(&mut c);
         c.set_seed(99);
-        assert_eq!(pending(&c), [1]);
+        assert_eq!(pending(&c), [1, 3, 4]);
+    }
+
+    #[test]
+    fn masks_go_with_their_effect() {
+        let mut c = Cards::new(4);
+        let fx = c.add_effect(MbEffect::QpAdd(6), &ids(&[1, 2]));
+        render(&mut c);
+        let mask = Mask::rect(0.0, 0.5, 1.0, 0.5);
+        c.set_effect_mask(fx, Some(mask.clone()));
+        assert_eq!(pending(&c), [1, 2]);
+        let (tl, _) = c.timeline();
+        assert_eq!(tl.entries[1].effects, [Fx { effect: MbEffect::QpAdd(6), mask: Some(mask) }]);
+        assert!(tl.entries[0].effects.is_empty());
+        // a project file keeps it
+        let json = serde_json::to_string(&c.state()).unwrap();
+        assert_eq!(serde_json::from_str::<EditState>(&json).unwrap(), c.state());
+        c.set_effect_mask(fx, None);
+        assert!(pending(&c).is_empty());
     }
 
     #[test]
@@ -554,5 +596,10 @@ mod tests {
         assert!(!affects(&MbEffect::KillIntra, 'I'));
         assert!(affects(&MbEffect::ZeroResidual, 'I'));
         assert!(affects(&MbEffect::MvdScale(2.0, 2.0), 'P'));
+        assert!(affects(&MbEffect::IntraMode(0), 'I'));
+        assert!(affects(&MbEffect::QpAdd(6), 'I'));
+        assert!(!affects(&MbEffect::Weight(1.1, 0), 'I'));
+        assert!(affects(&MbEffect::Transplant(3, 1.0), 'I'));
+        assert!(!affects(&MbEffect::RefShift(1), 'I'));
     }
 }

@@ -25,8 +25,12 @@ Doing this on the stream, instead of on decoded pixels, means the effects are re
 
 - Edit motion vectors: scale, shift, random jitter, or scale the coded vector differences so the error spreads through prediction.
 - Stop intra macroblocks from healing the picture, or remove all residual so the picture is built from prediction alone.
-- Apply effects to chosen frames, in layers, in a chosen order.
-- Later: limit an effect to a region (a "motion brush"), partial and proportional versions of the healing effects, and moving the motion of one clip onto the picture of another.
+- Rewrite intra prediction directions, so keyframes smear along wrong directions; set or raise quantizers, and scale transform coefficients by frequency.
+- Make blocks predict from older reference frames (echoes), and copy macroblocks from one frame into another.
+- Drift brightness and colour through weighted prediction, and change the deblocking strength; these only touch slice headers, so they work on any stream.
+- Every change stays within what the decoder is allowed to compute, so the result is still a valid stream.
+- Apply effects to chosen frames, in layers, in a chosen order, optionally limited to an area of the picture.
+- Later: a "motion brush" to paint those areas, partial and proportional versions of the healing effects, and moving the motion of one clip onto the picture of another.
 
 ### Editor
 

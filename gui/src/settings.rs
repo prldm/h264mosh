@@ -7,16 +7,24 @@ use std::path::{Path, PathBuf};
 
 const MAX_RECENT: usize = 10;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// most recent first
     pub recent: Vec<PathBuf>,
     pub auto_render: bool,
     pub export: ExportSettings,
+    /// reference frames of newly imported clips
+    pub import_refs: u32,
     /// where it is stored; None keeps it in memory only (tests)
     #[serde(skip)]
     path: Option<PathBuf>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { recent: Vec::new(), auto_render: false, export: ExportSettings::default(), import_refs: 1, path: None }
+    }
 }
 
 /// The user's configuration folder for h264mosh.

@@ -154,7 +154,10 @@ impl App {
                 let file = file.clone();
                 Job::spawn(ctx, move |r| project::open(&tools, &file, &cache_dir, r))
             }
-            _ => Job::spawn(ctx, move |r| project::import(&tools, &paths, &cache_dir, r)),
+            _ => {
+                let refs = self.settings.import_refs;
+                Job::spawn(ctx, move |r| project::import(&tools, &paths, &cache_dir, refs, r))
+            }
         };
         self.job = Some(Running::Open(job));
     }
@@ -419,6 +422,7 @@ impl App {
             }
             Action::Select(id) => self.active_effect = id,
             Action::Params(id, effect) => self.edit(ctx, Some(Gesture::EffectParams(id)), |c| c.set_effect(id, effect)),
+            Action::Mask(id, mask) => self.edit(ctx, Some(Gesture::EffectParams(id)), |c| c.set_effect_mask(id, mask)),
             Action::Enabled(id, on) => self.edit(ctx, None, |c| c.set_effect_enabled(id, on)),
             Action::Apply(id, on) => self.edit(ctx, None, |c| c.apply_effect(id, &sel, on)),
             Action::Delete(id) => {
@@ -595,6 +599,15 @@ impl App {
                         }
                     });
                 });
+                ui.menu_button(tr!("menu-new-clips"), |ui| {
+                    for refs in [1, 2, 4] {
+                        let label = tr!("import-refs", count = refs);
+                        let hint = if refs == 1 { tr!("import-refs-one-tooltip") } else { tr!("import-refs-more-tooltip") };
+                        if ui.radio_value(&mut self.settings.import_refs, refs, label).on_hover_text(hint).changed() {
+                            self.settings.save();
+                        }
+                    }
+                });
                 ui.separator();
                 let has = self.project.is_some();
                 if ui.add_enabled(has, egui::Button::new(tr!("menu-save")).shortcut_text(shortcut(&ctx, "S"))).clicked() {
@@ -763,7 +776,14 @@ impl App {
     fn effects_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(p) = &self.project else { return };
-        let actions = panel::show(ui, &p.cards, &p.frames, &self.timeline.selection, self.active_effect, p.cavlc);
+        let context = panel::Context {
+            frames: &p.frames,
+            selection: &self.timeline.selection,
+            active: self.active_effect,
+            cavlc: p.cavlc,
+            refs: p.refs,
+        };
+        let actions = panel::show(ui, &p.cards, &context);
         for action in actions {
             self.panel_action(&ctx, action);
         }
@@ -784,6 +804,11 @@ impl App {
         };
         let total = preview.rendered().len();
         let source = preview.rendered().report.frames.get(self.playhead).map(|f| f.src);
+        // the area the active effect is limited to
+        let area = self.project.as_ref().and_then(|p| {
+            let lane = p.cards.effects.iter().position(|e| Some(e.id) == self.active_effect)?;
+            Some((p.cards.effects[lane].mask.clone()?, panel::effect_color(lane)))
+        });
         let playing = self.playback.as_ref().map(|p| p.speed);
         let mut step: Option<i64> = None;
         let (mut toggle, mut hold_original) = (false, false);
@@ -829,6 +854,9 @@ impl App {
                 let image = egui::Rect::from_center_size(rect.center(), size * scale);
                 let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                 ui.painter().image(t.id(), image, uv, egui::Color32::WHITE);
+                if !show_original && let Some((mask, color)) = &area {
+                    paint_area(ui.painter(), image, mask, *color);
+                }
                 if show_original {
                     let label = egui::RichText::new(tr!("original-label")).strong().background_color(egui::Color32::from_black_alpha(160));
                     ui.put(egui::Rect::from_min_size(image.min + egui::vec2(8.0, 8.0), egui::vec2(200.0, 20.0)), egui::Label::new(label));
@@ -932,6 +960,37 @@ impl App {
     }
 }
 
+/// Outline the area of `mask` on the picture at `image`, and shade the part the effect
+/// leaves alone.
+fn paint_area(painter: &egui::Painter, image: egui::Rect, mask: &h264mosh::effects::Mask, color: egui::Color32) {
+    let shade = egui::Color32::from_black_alpha(110);
+    let to_screen = |[x, y, w, h]: [f32; 4]| {
+        let min = image.min + egui::vec2(x * image.width(), y * image.height());
+        egui::Rect::from_min_size(min, egui::vec2(w * image.width(), h * image.height())).intersect(image)
+    };
+    let rects: Vec<egui::Rect> = mask.rects.iter().map(|&r| to_screen(r)).collect();
+    if mask.invert {
+        for r in &rects {
+            painter.rect_filled(*r, 0.0, shade);
+        }
+    } else {
+        // shade around the rectangle (one rectangle is all the panel makes)
+        if let [r] = rects[..] {
+            for band in [
+                egui::Rect::from_min_max(image.min, egui::pos2(image.max.x, r.min.y)),
+                egui::Rect::from_min_max(egui::pos2(image.min.x, r.max.y), image.max),
+                egui::Rect::from_min_max(egui::pos2(image.min.x, r.min.y), egui::pos2(r.min.x, r.max.y)),
+                egui::Rect::from_min_max(egui::pos2(r.max.x, r.min.y), egui::pos2(image.max.x, r.max.y)),
+            ] {
+                painter.rect_filled(band, 0.0, shade);
+            }
+        }
+    }
+    for r in rects {
+        painter.rect_stroke(r, 0.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Inside);
+    }
+}
+
 /// "Ctrl+S" or "⌘S"
 fn shortcut(ctx: &egui::Context, key: &str) -> String {
     if ctx.os() == egui::os::OperatingSystem::Mac { format!("⌘{key}") } else { format!("Ctrl+{key}") }
@@ -1013,7 +1072,8 @@ mod tests {
     use super::*;
     use crate::export::{ExportFormat, Quality};
     use egui_kittest::Harness;
-    use h264mosh::effects::MbEffect;
+    use egui_kittest::kittest::Queryable;
+    use h264mosh::effects::{Mask, MbEffect};
     use std::process::Command;
     use std::time::Duration;
 
@@ -1276,6 +1336,69 @@ mod tests {
         assert_eq!(project(&h).cards.cards[3].copies, 2);
     }
 
+    /// New effects from the panel, one limited to an area; picture effects on a CABAC
+    /// stream; clips imported with several reference frames.
+    #[test]
+    fn effects_with_areas_and_picture_effects() {
+        let Some(clip) = test_clip("areas.264", 2, "320x180") else { return };
+        let mut h = harness(false);
+        open(&mut h, clip);
+        h.state_mut().timeline.selection = (0..30).collect();
+        let ctx = h.ctx.clone();
+        let mut lanes = Vec::new();
+        for e in [
+            MbEffect::IntraMode(4),
+            MbEffect::QpAdd(12),
+            MbEffect::Coeffs(0.25, 0.0),
+            MbEffect::Transplant(40, 0.5),
+            MbEffect::Deblock(6, 6),
+            MbEffect::Weight(1.1, 4),
+        ] {
+            h.state_mut().panel_action(&ctx, Action::Add(e));
+            lanes.push(h.state().active_effect.unwrap());
+        }
+        let mask = Mask::rect(0.0, 0.0, 0.5, 0.5);
+        h.state_mut().panel_action(&ctx, Action::Mask(lanes[0], Some(mask.clone())));
+        h.state_mut().active_effect = Some(lanes[0]);
+        h.run_steps(2);
+        assert_eq!(project(&h).cards.effect(lanes[0]).unwrap().mask, Some(mask));
+        render(&mut h);
+        let out = rendered(&h);
+        assert!(out.report.failed_effects.is_empty(), "{:?}", out.report.failed_effects);
+        assert_eq!(out.report.effects.slices, 30);
+        // the area is one undo step
+        key(&mut h, Key::Z, Modifiers::COMMAND);
+        assert_eq!(project(&h).cards.effect(lanes[0]).unwrap().mask, None);
+
+        // a CABAC stream takes the picture effects
+        let cabac = test_dir().join("cabac.264");
+        let status = Command::new(Tools::find(None).ffmpeg)
+            .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-t", "2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-bf", "0", "-f", "h264"])
+            .arg(&cabac)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut g = harness(false);
+        open(&mut g, cabac);
+        assert!(!project(&g).cavlc);
+        g.state_mut().timeline.selection = (10..20).collect();
+        let ctx = g.ctx.clone();
+        g.state_mut().panel_action(&ctx, Action::Add(MbEffect::Tint(6, -6)));
+        g.state_mut().panel_action(&ctx, Action::Add(MbEffect::Deblock(-6, -6)));
+        render(&mut g);
+        assert!(g.state().notice.is_none(), "{}", g.state().notice.as_ref().unwrap().text);
+        assert_eq!(rendered(&g).report.effects.slices, 10);
+
+        // new clips with more reference frames
+        let mp4 = test_clip("refs.mp4", 1, "320x180").unwrap();
+        let mut k = harness(false);
+        k.state_mut().settings.import_refs = 2;
+        open(&mut k, mp4);
+        assert_eq!(project(&k).refs, 2);
+        assert_eq!(project(&k).encoding.as_ref().unwrap().refs, 2);
+    }
+
     #[test]
     fn project_files_save_and_open() {
         let Some(clip) = test_clip("saved.mp4", 2, "320x180") else { return };
@@ -1392,6 +1515,26 @@ mod tests {
         h.state_mut().playhead = 12;
         wait(&mut h, |a| a.preview.as_ref().is_some_and(|p| p.shows(12)));
         shot(&mut h, "4_rendered");
+
+        // an effect limited to an area, shown on the preview while selected
+        h.state_mut().timeline.selection = (0..20).collect();
+        h.state_mut().panel_action(&ctx, Action::Add(MbEffect::IntraMode(4)));
+        let fx = h.state().active_effect.unwrap();
+        h.state_mut().panel_action(&ctx, Action::Mask(fx, Some(Mask::rect(0.1, 0.2, 0.5, 0.6))));
+        render(&mut h);
+        h.state_mut().playhead = 2;
+        wait(&mut h, |a| a.preview.as_ref().is_some_and(|p| p.shows(2)));
+        shot(&mut h, "4b_area");
+        let add = h.get_by_label(&tr!("effect-add")).rect().center();
+        h.hover_at(add);
+        mouse(&mut h, add, true, Modifiers::NONE);
+        mouse(&mut h, add, false, Modifiers::NONE);
+        h.run_steps(3);
+        let group = h.get_by_label_contains(&tr!("group-intra")).rect().center();
+        h.hover_at(group);
+        shot(&mut h, "4c_add_menu");
+        h.key_press(Key::Escape);
+        h.run_steps(3);
 
         h.state_mut().show_shortcuts = true;
         h.state_mut().export_dialog = Some(ExportSettings::default());

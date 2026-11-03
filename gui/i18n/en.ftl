@@ -17,6 +17,14 @@ menu-recent = Open recent
 menu-save = Save
 menu-save-as = Save as…
 menu-export = Export…
+menu-new-clips = New clips
+import-refs =
+    { $count ->
+        [one] 1 reference frame
+       *[other] { $count } reference frames
+    }
+import-refs-one-tooltip = Clips opened from now on are encoded with one reference frame: the classic datamosh.
+import-refs-more-tooltip = Clips opened from now on are encoded with several reference frames, for the Echo effect. Frame edits work as well, but motion may come from older frames.
 menu-edit = Edit
 menu-undo = Undo
 menu-redo = Redo
@@ -112,7 +120,7 @@ card-tooltip-removed = Deleted here: { $frames }
 
 effects-title = Effects
 effects-none = No effects yet. Select frames and add one.
-effects-need-cavlc = Effects need a CAVLC stream. Open the clips from video files (they are re-encoded so) instead of a raw stream.
+effects-need-cavlc = Most effects need a CAVLC stream: open the clips from video files (they are re-encoded so) instead of a raw stream. The picture effects work on any stream.
 effects-select-first = Select the frames first.
 effect-add = Add effect
 effect-label = { $name } { $summary }
@@ -126,8 +134,8 @@ effect-used =
     }
 effect-idle =
     { $count ->
-        [one] 1 of them is a keyframe, which this effect does not change.
-       *[other] { $count } of them are keyframes, which this effect does not change.
+        [one] 1 of them is a frame of a type this effect does not change.
+       *[other] { $count } of them are frames of a type this effect does not change.
     }
 effect-apply = Add to selection
 effect-apply-tooltip = Give this effect to the selected frames too.
@@ -146,10 +154,61 @@ effect-kill-intra = Freeze
 effect-kill-intra-about = Intra macroblocks of P-frames are skipped, so moshed areas never heal.
 effect-zero-residual = Ghost
 effect-zero-residual-about = Drops all residual data: pictures come from prediction only, no new detail comes in.
+effect-ref-shift = Echo
+effect-ref-shift-about = Blocks of P-frames predict from older frames, so moving parts leave echoes. Needs clips opened with several reference frames.
+effect-ref-shift-one-ref = This stream has one reference frame, so nothing changes. Open the clips again after choosing more reference frames under File ▸ New clips.
+effect-transplant = Transplant
+effect-transplant-about = Copies macroblocks of another frame into the same places, all of them or some at random. Keyframes only take its intra blocks.
+effect-intra-mode = Intra direction
+effect-intra-mode-about = Sets the direction intra blocks are predicted from. The detail stays, so keyframes smear along the new direction, and the P-frames after them carry it on.
+effect-intra-rotate = Intra turn
+effect-intra-rotate-about = Turns every intra prediction direction, so edges are drawn at the wrong angle.
+effect-intra-random = Intra scramble
+effect-intra-random-about = Gives some of the intra blocks a random direction.
+effect-intra-cascade = Intra cascade
+effect-intra-cascade-about = Writes the same code into every intra direction. What it means depends on the blocks around, so the change ripples across the picture.
+effect-qp-add = Quantizer shift
+effect-qp-add-about = Changes the quantizer: the coded detail is scaled up or down (twice as strong every 6 steps), as far as the stream stays valid.
+effect-qp-set = Quantizer
+effect-qp-set-about = Sets the quantizer of every macroblock, as far as the stream stays valid.
+effect-coeffs = Frequencies
+effect-coeffs-about = Multiplies the transform coefficients from a frequency on: 0 removes the fine detail, large values sharpen it into ringing, negative values invert it.
+effect-dc-shift = Block tone
+effect-dc-shift-about = Adds to the brightness and colour of every block. In keyframes it builds up along the prediction.
+effect-deblock = Deblocking
+effect-deblock-about = Strength of the deblocking filter: higher smooths block edges more, lower leaves them hard.
+effect-weight = Exposure drift
+effect-weight-about = Brightness gain and offset of the motion prediction. It adds up from P-frame to P-frame until the next keyframe.
+effect-tint = Colour drift
+effect-tint-about = Colour offsets of the motion prediction: the colours drift from P-frame to P-frame.
 effect-debug = Debug effect
+group-motion = Motion
+group-blocks = Blocks
+group-intra = Intra prediction
+group-residual = Detail and quantizer
+group-picture = Picture
+direction-vertical = vertical
+direction-horizontal = horizontal
+direction-dc = flat (DC)
+direction-down-left = diagonal down-left
+direction-down-right = diagonal down-right
+direction-vertical-right = vertical-right
+direction-horizontal-down = horizontal-down
+direction-vertical-left = vertical-left
+direction-horizontal-up = horizontal-up
 summary-scale = ×{ NUMBER($x, maximumFractionDigits: 2) } / ×{ NUMBER($y, maximumFractionDigits: 2) }
 summary-shift = { NUMBER($x, maximumFractionDigits: 2) } / { NUMBER($y, maximumFractionDigits: 2) } px
 summary-jitter = ±{ NUMBER($px, maximumFractionDigits: 2) } px
+summary-frames = { $n } frames
+summary-transplant = from { NUMBER($frame, useGrouping: "false") }, { NUMBER($percent, maximumFractionDigits: 0) }%
+summary-degrees = { NUMBER($degrees, maximumFractionDigits: 1) }°
+summary-percent = { NUMBER($percent, maximumFractionDigits: 0) }%
+summary-number = { $n }
+summary-signed = { $n }
+summary-coeffs = ×{ NUMBER($factor, maximumFractionDigits: 2) } from { NUMBER($percent, maximumFractionDigits: 0) }%
+summary-two = { $a } / { $b }
+summary-three = { $a } / { $b } / { $c }
+summary-weight = ×{ NUMBER($gain, maximumFractionDigits: 2) } / { $offset }
 param-horizontal = Horizontal
 param-vertical = Vertical
 param-horizontal-px = Horizontal (px)
@@ -157,6 +216,30 @@ param-vertical-px = Vertical (px)
 param-amount-px = Amount (px)
 param-pattern = Pattern {" "}
 param-new-pattern = New pattern
+param-frames-back = Frames back
+param-from-frame = From frame {" "}
+param-amount = Amount
+param-direction = Direction
+param-turn = Turn
+param-code = Code
+param-quantizer-offset = Quantizer offset
+param-quantizer = Quantizer
+param-from-frequency = From frequency
+param-factor = Factor
+param-brightness = Brightness
+param-blue = Blue
+param-red = Red
+param-deblock-alpha = Edge strength
+param-deblock-beta = Edge threshold
+param-gain = Gain
+param-offset = Offset
+area-limit = Only in an area
+area-limit-tooltip = Limit the effect to a rectangle of the picture (whole macroblocks). The preview shows it while the effect is selected.
+area-left = Left
+area-top = Top
+area-width = Width
+area-height = Height
+area-invert = Everywhere but there
 
 ## Preview
 
