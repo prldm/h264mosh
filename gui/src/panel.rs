@@ -69,8 +69,8 @@ fn groups() -> [(String, Vec<MbEffect>); 5] {
         ),
         (tr!("group-blocks"), vec![MbEffect::KillIntra, MbEffect::ZeroResidual, MbEffect::Transplant(0, 0.5)]),
         (tr!("group-intra"), vec![MbEffect::IntraMode(0), MbEffect::IntraRotate(2), MbEffect::IntraRandom(0.5), MbEffect::IntraCascade(3)]),
-        (tr!("group-residual"), vec![MbEffect::QpAdd(12), MbEffect::QpSet(51), MbEffect::Coeffs(0.25, 0.0), MbEffect::DcShift(8, 0, 0)]),
-        (tr!("group-picture"), vec![MbEffect::Deblock(6, 6), MbEffect::Weight(1.05, 0), MbEffect::Tint(3, -3)]),
+        (tr!("group-residual"), vec![MbEffect::QpAdd(12), MbEffect::QpSet(51), MbEffect::Coeffs(0.25, 0.0), MbEffect::DcShift(1, 0, 0)]),
+        (tr!("group-picture"), vec![MbEffect::Deblock(6, 6), MbEffect::Weight(1.02, 0), MbEffect::Tint(1, -1)]),
     ]
 }
 
@@ -359,22 +359,23 @@ fn params(ui: &mut egui::Ui, effect: &mut MbEffect, seed: u64, frames: usize, ac
             percent(ui, from, tr!("param-from-frequency"));
             factor(ui, f, tr!("param-factor"));
         }
+        // these build up from block to block and frame to frame: small steps
         MbEffect::DcShift(y, cb, cr) => {
-            int(ui, y, -64..=64, tr!("param-brightness"));
-            int(ui, cb, -64..=64, tr!("param-blue"));
-            int(ui, cr, -64..=64, tr!("param-red"));
+            int(ui, y, -16..=16, tr!("param-brightness"));
+            int(ui, cb, -16..=16, tr!("param-blue"));
+            int(ui, cr, -16..=16, tr!("param-red"));
         }
         MbEffect::Deblock(a, b) => {
             int(ui, a, -6..=6, tr!("param-deblock-alpha"));
             int(ui, b, -6..=6, tr!("param-deblock-beta"));
         }
         MbEffect::Weight(gain, offset) => {
-            ui.add(egui::Slider::new(gain, 0.0..=2.0).step_by(0.01).text(tr!("param-gain")));
-            int(ui, offset, -64..=64, tr!("param-offset"));
+            ui.add(egui::Slider::new(gain, 0.5..=1.5).step_by(0.01).text(tr!("param-gain")));
+            int(ui, offset, -16..=16, tr!("param-offset"));
         }
         MbEffect::Tint(cb, cr) => {
-            int(ui, cb, -64..=64, tr!("param-blue"));
-            int(ui, cr, -64..=64, tr!("param-red"));
+            int(ui, cb, -16..=16, tr!("param-blue"));
+            int(ui, cr, -16..=16, tr!("param-red"));
         }
         _ => {}
     }
