@@ -1,6 +1,7 @@
 //! H.264 Annex B bitstream parser/writer with frame- and macroblock-level datamosh operations.
 
 pub mod bits;
+pub mod cabac;
 pub mod cavlc;
 pub mod cavlc_tables;
 pub mod common;
