@@ -18,7 +18,7 @@ Doing this on the stream, instead of on decoded pixels, means the effects are re
 
 - Drop keyframes (all of them, or chosen ones) so motion bleeds across cuts.
 - Repeat any frame any number of times ("bloom" for P-frames, freeze for keyframes).
-- Reorder, delete and move frames freely, with the stream renumbered so the result is still valid.
+- Reorder, delete and move frames freely, with the stream renumbered so the result is still valid. This works on streams with B-frames too, straight from the camera or encoder: a B-frame moved elsewhere predicts from its new neighbours.
 - Join several clips into one stream, then mosh across the joins.
 
 ### Macroblock level
@@ -52,7 +52,6 @@ The same engine for scripting: prepare clips, mosh them with a plan, inspect str
 
 ### Later, bigger
 
-- B-frame aware frame editing.
 - Macroblock editing for CABAC streams (today only CAVLC).
 - Motion vector effects on B-frames.
 - Audio.
