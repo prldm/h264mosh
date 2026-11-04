@@ -1,8 +1,9 @@
 //! External tool: ffmpeg (with libx264) for decoding, scaling and encoding.
 //!
 //! prep:   input clip --ffmpeg (scale, fps, libx264 with mosh-friendly settings)--> raw .264, concatenated
-//! render: moshed .264 --ffmpeg (decode, libx264)--> .mp4
-//! decode: .264 --ffmpeg (decode, scale)--> RGBA frames (previews)
+//! render: moshed .264 --ffmpeg (decode, libx264)--> .mp4, .mkv (with the clips' other tracks)
+//! remux:  moshed .264 --ffmpeg (copy)--> .mp4, .mkv (with the clips' other tracks)
+//! decode: .264 --ffmpeg (decode, scale)--> RGBA frames (previews); clips --> audio samples
 //!
 //! Long jobs report progress through a callback, which can also cancel them.
 
@@ -11,7 +12,7 @@ use crate::stream::{NalKind, Stream, group_access_units};
 use crate::ts;
 use anyhow::{Context, Result, bail};
 use std::collections::VecDeque;
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
@@ -19,6 +20,11 @@ use std::sync::mpsc;
 use std::thread::Scope;
 
 const RAW_EXTENSIONS: &[&str] = &["264", "h264", "avc", "26l", "jsv", "bin"];
+/// audio an MP4 takes as it is; other audio is encoded to AAC
+const MP4_AUDIO: &[&str] = &["aac", "mp3", "ac3", "eac3", "alac"];
+/// subtitles an MP4 takes as text (mov_text); others (pictures) stay out
+const TEXT_SUBTITLES: &[&str] = &["subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"];
+const AAC_BITRATE: &str = "192k";
 
 pub fn is_raw_h264(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| RAW_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
@@ -481,8 +487,133 @@ pub fn stream_fps(data: &[u8]) -> String {
     }
 }
 
-/// Decode a (moshed) raw stream and encode the result as a normal video file.
-/// `progress` gets the frames done and returns false to cancel ([`Cancelled`]).
+/// Audio and subtitles of the clips a stream was made from, to go along with the video
+/// in a container.
+pub struct Tracks<'a> {
+    /// the clips, one after the other, with the frames each gives in the stream
+    pub clips: &'a [(PathBuf, usize)],
+    /// frames of the video: the tracks end with it
+    pub frames: usize,
+}
+
+impl Tracks<'_> {
+    /// ffmpeg arguments for a command whose input 0 is the video at `fps`: the inputs
+    /// (after the video's), then the maps and codecs for `output`. One clip keeps its
+    /// audio and subtitles (in an MP4, audio it cannot take is encoded to AAC, and only
+    /// text subtitles stay); several clips get the first audio track of each, joined.
+    fn args(&self, tools: &Tools, fps: &str, output: &Path) -> Result<(Vec<OsString>, Vec<String>)> {
+        let rate = fps_value(fps).with_context(|| format!("frame rate {fps}"))?;
+        let mp4 = is_mp4(output);
+        let mut inputs = Vec::new();
+        let mut outputs: Vec<String> = vec!["-map".into(), "0:v:0".into()];
+        match self.clips {
+            [(path, _)] => {
+                // output stream number; the video is 0
+                let mut k = 1;
+                for (index, kind, codec) in streams(tools, path)? {
+                    let c = match kind.as_str() {
+                        "audio" if mp4 && !MP4_AUDIO.contains(&codec.as_str()) => "aac",
+                        "audio" => "copy",
+                        "subtitle" if !mp4 => "copy",
+                        "subtitle" if TEXT_SUBTITLES.contains(&codec.as_str()) => "mov_text",
+                        "attachment" if !mp4 => "copy",
+                        _ => continue,
+                    };
+                    outputs.extend(["-map".into(), format!("1:{index}"), format!("-c:{k}"), c.into()]);
+                    if c == "aac" {
+                        outputs.extend([format!("-b:{k}"), AAC_BITRATE.into()]);
+                    }
+                    k += 1;
+                }
+                if k > 1 {
+                    inputs.extend(["-i".into(), path.into()]);
+                }
+            }
+            clips => {
+                if let Some((audio_inputs, graph)) = joined_audio(tools, clips, rate, 1, 48000)? {
+                    inputs.extend(audio_inputs);
+                    inputs.extend(["-filter_complex".into(), graph.into()]);
+                    outputs.extend(["-map", "[audio]", "-c:a", "aac", "-b:a", AAC_BITRATE].map(String::from));
+                }
+            }
+        }
+        outputs.extend(["-t".into(), format!("{:.6}", self.frames as f64 / rate)]);
+        Ok((inputs, outputs))
+    }
+}
+
+fn is_mp4(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| ["mp4", "mov", "m4v"].contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// (index, type, codec) of each stream in a file; none in a raw H.264 stream.
+fn streams(tools: &Tools, path: &Path) -> Result<Vec<(usize, String, String)>> {
+    if is_raw_h264(path) {
+        return Ok(Vec::new());
+    }
+    let mut cmd = command(&tools.ffprobe);
+    cmd.args(["-v", "error", "-show_entries", "stream=index,codec_type,codec_name", "-of", "compact=p=0"]).arg(path);
+    let out = tools.run(cmd).with_context(|| format!("reading the tracks of {}", path.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let get = |k: &str| line.split('|').find_map(|f| f.strip_prefix(k)?.strip_prefix('=')).map(str::to_string);
+            Some((get("index")?.parse().ok()?, get("codec_type")?, get("codec_name").unwrap_or_default()))
+        })
+        .collect())
+}
+
+/// The first audio track of each clip, one after the other, each cut or padded with
+/// silence to the clip's frames at `fps`, as stereo at `sample_rate`: ffmpeg inputs
+/// (numbered from `first`) and a filter graph ending in [audio]. None if no clip has
+/// audio.
+fn joined_audio(
+    tools: &Tools,
+    clips: &[(PathBuf, usize)],
+    fps: f64,
+    first: usize,
+    sample_rate: u32,
+) -> Result<Option<(Vec<OsString>, String)>> {
+    let mut inputs: Vec<OsString> = Vec::new();
+    let (mut graph, mut labels) = (Vec::new(), String::new());
+    for (i, (path, frames)) in clips.iter().enumerate() {
+        let source = if streams(tools, path)?.iter().any(|(_, kind, _)| kind == "audio") {
+            let n = first + inputs.len() / 2;
+            inputs.extend(["-i".into(), path.into()]);
+            format!("[{n}:a:0]apad")
+        } else {
+            "anullsrc".into()
+        };
+        let end = *frames as f64 / fps;
+        let format = format!("aformat=sample_fmts=fltp:sample_rates={sample_rate}:channel_layouts=stereo");
+        graph.push(format!("{source},{format},atrim=end={end:.6}[a{i}]"));
+        labels += &format!("[a{i}]");
+    }
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    graph.push(format!("{labels}concat=n={}:v=0:a=1[audio]", clips.len()));
+    Ok(Some((inputs, graph.join(";"))))
+}
+
+/// The audio of `clips` (as in [`Tracks`]: the first track of each, joined, each as
+/// long as its frames at `fps`), as interleaved 16-bit stereo samples at `sample_rate`.
+/// Empty if no clip has audio.
+pub fn decode_audio(tools: &Tools, clips: &[(PathBuf, usize)], fps: &str, sample_rate: u32) -> Result<Vec<i16>> {
+    let rate = fps_value(fps).with_context(|| format!("frame rate {fps}"))?;
+    let Some((inputs, graph)) = joined_audio(tools, clips, rate, 0, sample_rate)? else { return Ok(Vec::new()) };
+    let mut cmd = tools.ffmpeg();
+    cmd.args(inputs).arg("-filter_complex").arg(graph);
+    cmd.args(["-map", "[audio]", "-f", "s16le", "-ac", "2", "-ar", &sample_rate.to_string(), "pipe:1"]);
+    let out = tools.run(cmd).context("decoding the audio of the clips")?;
+    Ok(out.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+}
+
+/// Decode a (moshed) raw stream and encode the result as a normal video file, with the
+/// clips' `tracks` if given. `progress` gets the frames done and returns false to
+/// cancel ([`Cancelled`]).
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     tools: &Tools,
     data: &[u8],
@@ -490,13 +621,15 @@ pub fn render(
     fps: &str,
     preset: &str,
     crf: f32,
+    tracks: Option<&Tracks>,
     progress: &mut dyn FnMut(u64) -> bool,
 ) -> Result<()> {
     tools.check_libx264()?;
+    let (inputs, outputs) = tracks.map(|t| t.args(tools, fps, output)).transpose()?.unwrap_or_default();
     let mut cmd = tools.ffmpeg_with_progress();
-    cmd.args(["-y", "-f", "h264", "-framerate", fps, "-i", "pipe:0"]);
+    cmd.args(["-y", "-f", "h264", "-framerate", fps, "-i", "pipe:0"]).args(inputs).args(outputs);
     cmd.args(["-c:v", "libx264", "-preset", preset, "-crf", &crf.to_string(), "-pix_fmt", "yuv420p"]);
-    if output.extension().is_some_and(|e| e == OsStr::new("mp4") || e == OsStr::new("mov")) {
+    if is_mp4(output) {
         cmd.args(["-movflags", "+faststart"]);
     }
     cmd.arg(output);
@@ -505,18 +638,27 @@ pub fn render(
 }
 
 /// Put a raw stream into a container (mp4, mkv, ...) as it is, without re-encoding:
-/// players decode the moshed stream themselves. `progress` as in `render`.
-pub fn remux(tools: &Tools, data: &[u8], output: &Path, fps: &str, progress: &mut dyn FnMut(u64) -> bool) -> Result<()> {
+/// players decode the moshed stream themselves. `tracks` and `progress` as in `render`.
+pub fn remux(
+    tools: &Tools,
+    data: &[u8],
+    output: &Path,
+    fps: &str,
+    tracks: Option<&Tracks>,
+    progress: &mut dyn FnMut(u64) -> bool,
+) -> Result<()> {
+    let (inputs, outputs) = tracks.map(|t| t.args(tools, fps, output)).transpose()?.unwrap_or_default();
     let mut cmd = tools.ffmpeg_with_progress();
     // with B-frames the container needs timestamps, which raw H.264 does not have
     let rate = fps_ratio(fps).with_context(|| format!("frame rate {fps}"))?;
     let timed = ts::with_timestamps(data, rate)?;
     if timed.is_some() {
-        cmd.args(["-y", "-f", "mpegts", "-i", "pipe:0", "-c:v", "copy"]);
+        cmd.args(["-y", "-f", "mpegts", "-i", "pipe:0"]);
     } else {
-        cmd.args(["-y", "-f", "h264", "-framerate", fps, "-i", "pipe:0", "-c:v", "copy"]);
+        cmd.args(["-y", "-f", "h264", "-framerate", fps, "-i", "pipe:0"]);
     }
-    if output.extension().is_some_and(|e| e == OsStr::new("mp4") || e == OsStr::new("mov")) {
+    cmd.args(inputs).args(outputs).args(["-c:v", "copy"]);
+    if is_mp4(output) {
         cmd.args(["-movflags", "+faststart"]);
     }
     cmd.arg(output);

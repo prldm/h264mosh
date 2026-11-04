@@ -751,7 +751,7 @@ fn main() -> Result<()> {
             let data = std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
             let fps = fps.unwrap_or_else(|| pipeline::stream_fps(&data));
             eprintln!("rendering {} -> {} ({fps} fps)", input.display(), output.display());
-            pipeline::render(&tools, &data, &output, &fps, &preset, crf, &mut |_| true)?;
+            pipeline::render(&tools, &data, &output, &fps, &preset, crf, None, &mut |_| true)?;
             println!("written {}", output.display());
         }
         Cmd::Info { input, frames, mbs } => cmd_info(&tools, &input, frames, mbs)?,

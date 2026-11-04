@@ -584,7 +584,7 @@ fn remux_keeps_the_moshed_pictures() {
     let (raw, err) = decode(&bytes, "remux.264");
     assert!(err.is_empty(), "{err}");
     let mp4 = tmp("remux.mp4");
-    remux(&Tools::find(None), &bytes, &mp4, "25", &mut |_| true).unwrap();
+    remux(&Tools::find(None), &bytes, &mp4, "25", None, &mut |_| true).unwrap();
     let out = Command::new(ffmpeg()).args(["-v", "error", "-nostdin", "-i"]).arg(&mp4).args(["-f", "framemd5", "-"]).output().unwrap();
     let md5: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -1231,7 +1231,7 @@ fn remux_keeps_bframe_pictures() {
             let bytes = out.write(false).unwrap();
             let (raw, _) = decode(&bytes, "remux_b.264");
             let mp4 = tmp("remux_b.mp4");
-            remux(&Tools::find(None), &bytes, &mp4, "24000/1001", &mut |_| true).unwrap();
+            remux(&Tools::find(None), &bytes, &mp4, "24000/1001", None, &mut |_| true).unwrap();
             let (md5, err) = decode(&std::fs::read(&mp4).unwrap(), "remux_b.mp4");
             assert!(err.is_empty(), "{name} {case}: {err}");
             assert!(md5 == raw, "{name} {case}: remuxed pictures differ ({} vs {})", md5.len(), raw.len());

@@ -469,10 +469,10 @@ pub fn export(tools: &Tools, rendered: &Rendered, fps: &str, path: &Path, settin
     progress(0);
     match settings.format {
         ExportFormat::Raw => std::fs::write(path, &rendered.bytes).with_context(|| format!("writing {}", path.display())),
-        ExportFormat::Copy => pipeline::remux(tools, &rendered.bytes, path, fps, &mut progress),
+        ExportFormat::Copy => pipeline::remux(tools, &rendered.bytes, path, fps, None, &mut progress),
         ExportFormat::Baked => {
             let (preset, crf) = settings.quality.encoder();
-            pipeline::render(tools, &rendered.bytes, path, fps, preset, crf, &mut progress)
+            pipeline::render(tools, &rendered.bytes, path, fps, preset, crf, None, &mut progress)
         }
     }
 }
