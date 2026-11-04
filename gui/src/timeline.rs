@@ -62,6 +62,8 @@ pub enum Event {
 pub struct Strip<'a> {
     pub cards: &'a Cards,
     pub frames: &'a [FrameInfo],
+    /// source frames in display order
+    pub display: &'a [usize],
     pub thumbs: &'a [Option<egui::TextureHandle>],
     /// picture height / width
     pub aspect: f32,
@@ -489,7 +491,7 @@ impl TimelineView {
         if self.drag.is_none() && self.edge_drag.is_none() {
             let lane = pointer.and_then(|p| Some((l.lane_at(p.y)?, l.index_at(p.x))));
             if let Some((k, _)) = lane.filter(|&(k, i)| i < len && cards.cards[i].effects.contains(&cards.effects[k].id)) {
-                response.on_hover_text_at_pointer(effect_label(&cards.effects[k].effect));
+                response.on_hover_text_at_pointer(effect_label(&cards.effects[k].effect, s.display));
             } else if let Some(i) = hovered {
                 response.on_hover_text_at_pointer(tooltip(cards, i, s.frames));
             }

@@ -777,6 +777,7 @@ impl App {
         let strip = Strip {
             cards: &p.cards,
             frames: &p.frames,
+            display: &p.source.display,
             thumbs: &self.thumbs,
             aspect: h as f32 / w as f32,
             playhead: self.playhead_card(),
@@ -793,6 +794,7 @@ impl App {
         let Some(p) = &self.project else { return };
         let context = panel::Context {
             frames: &p.frames,
+            display: &p.source.display,
             selection: &self.timeline.selection,
             active: self.active_effect,
             cavlc: p.cavlc,

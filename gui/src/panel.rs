@@ -29,6 +29,8 @@ pub enum Action {
 /// What the panel shows besides the edit.
 pub struct Context<'a> {
     pub frames: &'a [FrameInfo],
+    /// source frames in display order
+    pub display: &'a [usize],
     pub selection: &'a HashSet<CardId>,
     pub active: Option<EffectId>,
     /// CAVLC entropy coding (macroblock effects need it)
@@ -142,7 +144,14 @@ fn direction_name(d: u8) -> String {
 }
 
 /// The parameters in a few characters.
-pub fn effect_summary(e: &MbEffect) -> String {
+/// Display position of source frame `src` (`display`: source frames in display order),
+/// the frame number shown to the user.
+pub fn shown_at(display: &[usize], src: usize) -> usize {
+    display.iter().position(|&s| s == src).unwrap_or(src)
+}
+
+/// The parameters in short; frames are named by display position (`display`).
+pub fn effect_summary(e: &MbEffect, display: &[usize]) -> String {
     let px = |q: i32| q as f64 / 4.0;
     match *e {
         MbEffect::MvScale(x, y) | MbEffect::MvdScale(x, y) => tr!("summary-scale", x = x as f64, y = y as f64),
@@ -150,7 +159,7 @@ pub fn effect_summary(e: &MbEffect) -> String {
         MbEffect::MvJitter(n) => tr!("summary-jitter", px = px(n)),
         MbEffect::RefShift(n) => tr!("summary-frames", n = format!("{n:+}")),
         MbEffect::Transplant(frame, amount) | MbEffect::MotionTransplant(frame, amount) => {
-            tr!("summary-transplant", frame = frame, percent = amount as f64 * 100.0)
+            tr!("summary-transplant", frame = shown_at(display, frame), percent = amount as f64 * 100.0)
         }
         MbEffect::IntraMode(d) => direction_name(d),
         MbEffect::IntraRotate(n) => tr!("summary-degrees", degrees = n as f64 * 22.5),
@@ -167,8 +176,8 @@ pub fn effect_summary(e: &MbEffect) -> String {
 }
 
 /// Name and parameters, for lanes and lists.
-pub fn effect_label(e: &MbEffect) -> String {
-    let summary = effect_summary(e);
+pub fn effect_label(e: &MbEffect, display: &[usize]) -> String {
+    let summary = effect_summary(e, display);
     if summary.is_empty() { effect_name(e) } else { tr!("effect-label", name = effect_name(e), summary = summary) }
 }
 
@@ -222,7 +231,7 @@ pub fn show(ui: &mut egui::Ui, cards: &Cards, c: &Context) -> Vec<Action> {
                 }
                 // the name takes the room that is left, shortened if needed
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let label = effect_label(&fx.effect);
+                    let label = effect_label(&fx.effect, c.display);
                     let name = ui.add(egui::Button::selectable(c.active == Some(fx.id), label.clone()).truncate());
                     if name.on_hover_text(label).clicked() {
                         actions.push(Action::Select(if c.active == Some(fx.id) { None } else { Some(fx.id) }));
@@ -244,7 +253,7 @@ pub fn show(ui: &mut egui::Ui, cards: &Cards, c: &Context) -> Vec<Action> {
     }
     ui.add_space(4.0);
     let mut effect = fx.effect.clone();
-    params(ui, &mut effect, cards.seed, c.frames.len(), &mut actions);
+    params(ui, &mut effect, cards.seed, c.display, &mut actions);
     if effect != fx.effect {
         actions.push(Action::Params(fx.id, effect));
     }
@@ -276,7 +285,8 @@ pub fn show(ui: &mut egui::Ui, cards: &Cards, c: &Context) -> Vec<Action> {
 }
 
 /// Sliders for the parameters of `effect`.
-fn params(ui: &mut egui::Ui, effect: &mut MbEffect, seed: u64, frames: usize, actions: &mut Vec<Action>) {
+/// Sliders for the parameters of `effect`; frames are chosen by display position.
+fn params(ui: &mut egui::Ui, effect: &mut MbEffect, seed: u64, display: &[usize], actions: &mut Vec<Action>) {
     let factor = |ui: &mut egui::Ui, v: &mut f32, label: String| {
         ui.add(egui::Slider::new(v, -8.0..=8.0).step_by(0.05).text(label));
     };
@@ -295,6 +305,14 @@ fn params(ui: &mut egui::Ui, effect: &mut MbEffect, seed: u64, frames: usize, ac
         let mut p = *v * 100.0;
         if ui.add(egui::Slider::new(&mut p, 0.0..=100.0).step_by(1.0).suffix("%").text(label)).changed() {
             *v = p / 100.0;
+        }
+    };
+    // a source frame, chosen by its display position
+    let frame = |ui: &mut egui::Ui, src: &mut usize| {
+        let mut k = shown_at(display, *src);
+        let last = display.len().saturating_sub(1);
+        if ui.add(egui::DragValue::new(&mut k).range(0..=last).prefix(tr!("param-from-frame"))).changed() {
+            *src = display.get(k).copied().unwrap_or(k);
         }
     };
     let pattern = |ui: &mut egui::Ui, actions: &mut Vec<Action>| {
@@ -322,16 +340,15 @@ fn params(ui: &mut egui::Ui, effect: &mut MbEffect, seed: u64, frames: usize, ac
             pattern(ui, actions);
         }
         MbEffect::RefShift(n) => int(ui, n, -15..=15, tr!("param-frames-back")),
-        MbEffect::Transplant(frame, amount) => {
-            let last = frames.saturating_sub(1);
-            ui.add(egui::DragValue::new(frame).range(0..=last).prefix(tr!("param-from-frame")));
+        MbEffect::Transplant(src, amount) => {
+            frame(ui, src);
             percent(ui, amount, tr!("param-amount"));
             if *amount < 1.0 {
                 pattern(ui, actions);
             }
         }
-        MbEffect::MotionTransplant(frame, mix) => {
-            ui.add(egui::DragValue::new(frame).range(0..=frames.saturating_sub(1)).prefix(tr!("param-from-frame")));
+        MbEffect::MotionTransplant(src, mix) => {
+            frame(ui, src);
             percent(ui, mix, tr!("param-mix"));
         }
         MbEffect::IntraMode(d) => {
