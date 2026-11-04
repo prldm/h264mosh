@@ -1,11 +1,12 @@
-//! Self checks: bit-exact re-serialization and frame_num conformance.
+//! Self checks: bit-exact re-serialization, frame_num and picture order count conformance.
 
 use crate::common::RbspTail;
 use crate::mb;
+use crate::mosh::{decode_pocs, display_order};
 use crate::stream::{AccessUnit, NalKind, Stream};
 use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Default)]
 pub struct RoundtripReport {
@@ -89,6 +90,51 @@ pub fn frame_num_violations(aus: &[AccessUnit]) -> Vec<usize> {
         }
     }
     bad
+}
+
+/// Display order as a decoder derives it from the picture order counts.
+#[derive(Default, Debug)]
+pub struct PocReport {
+    /// frames (decoding order) in display order
+    pub display: Vec<usize>,
+    /// frames with the picture order count of an earlier frame of the same IDR period
+    pub duplicates: Vec<usize>,
+    /// frames preceded in decoding order by more frames shown after them than the
+    /// SPS allows (max_num_reorder_frames)
+    pub reordered_too_far: Vec<usize>,
+}
+
+pub fn poc_check(aus: &[AccessUnit]) -> PocReport {
+    let pocs = decode_pocs(aus);
+    let display = display_order(aus, &pocs);
+    let mut rep = PocReport::default();
+    let mut seen = HashSet::new();
+    for (i, au) in aus.iter().enumerate() {
+        if au.is_idr() || au.first_slice().is_some_and(|s| s.header.has_mmco5()) {
+            seen.clear();
+        }
+        if let Some(p) = pocs[i]
+            && !seen.insert(p)
+        {
+            rep.duplicates.push(i);
+        }
+    }
+    let mut shown_at = vec![0; aus.len()];
+    for (k, &i) in display.iter().enumerate() {
+        shown_at[i] = k;
+    }
+    let mut decoded = BTreeSet::new();
+    for (i, au) in aus.iter().enumerate() {
+        let later = decoded.range(shown_at[i] + 1..).count();
+        if let Some(s) = au.first_slice()
+            && later > s.sps.reorder_limits().0 as usize
+        {
+            rep.reordered_too_far.push(i);
+        }
+        decoded.insert(shown_at[i]);
+    }
+    rep.display = display;
+    rep
 }
 
 #[derive(Default)]

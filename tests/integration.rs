@@ -4,7 +4,7 @@
 use h264mosh::effects::{Fx, Mask, MbEffect};
 use h264mosh::mb::MbContext;
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
-use h264mosh::pipeline::{Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
+use h264mosh::pipeline::{BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
 use h264mosh::pps::Pps;
 use h264mosh::residual::Scaling;
 use h264mosh::slice::SliceType;
@@ -205,14 +205,17 @@ fn mosh_without_edits_is_identity() {
 }
 
 #[test]
-fn mosh_refuses_bframes_and_keeps_first_frame() {
+fn mosh_edits_bframes_and_keeps_first_frame() {
     if !ffmpeg_available() {
         return;
     }
     let data = encode("testsrc2", 1, &["-bf", "2"]);
     let plan = MoshPlan { drop: Some("3".parse().unwrap()), ..Default::default() };
-    let err = mosh(Stream::parse(&data).unwrap(), &plan).err().expect("B-frames must be refused");
-    assert!(err.to_string().contains("B-frame"), "{err}");
+    let (out, rep) = mosh(Stream::parse(&data).unwrap(), &plan).unwrap();
+    assert_eq!(rep.dropped, vec![3]);
+    let (md5, err) = decode(&out.write(false).unwrap(), "bframe_drop.264");
+    assert!(err.is_empty(), "{err}");
+    assert_eq!(md5.len(), 24);
 
     let data = mosh_friendly("testsrc2", 1, &[]);
     let plan = MoshPlan { drop: Some("0-1".parse().unwrap()), ..Default::default() };
@@ -493,6 +496,8 @@ fn prep_reports_progress_and_cancels() {
         scenecut: true,
         cavlc: true,
         refs: 1,
+        bframes: 0,
+        b_pyramid: BPyramid::None,
         x264_params: None,
     };
     let inputs = [clip.clone(), clip];
@@ -869,6 +874,8 @@ fn prep_can_use_several_reference_frames() {
         scenecut: true,
         cavlc: true,
         refs: 3,
+        bframes: 0,
+        b_pyramid: BPyramid::None,
         x264_params: None,
     };
     let out = tmp("prep_refs_out.264");
@@ -878,4 +885,172 @@ fn prep_can_use_several_reference_frames() {
     assert_eq!(sps.max_num_ref_frames, 3);
     let used = stream.nals.iter().filter_map(|n| n.slice()).any(|s| s.header.num_ref_idx_l0_active_minus1 == 2);
     assert!(used);
+}
+
+/// Streams with B-frames: x264 without and with reference B-frames (b-pyramid, which
+/// brings MMCO and reference list modifications), CABAC and CAVLC, spatial and temporal
+/// direct prediction. The first one predicts B-frames without weights from picture
+/// order count distances, so its pictures can be compared after moving B-frames.
+fn bframe_configs() -> Vec<(&'static str, Vec<u8>)> {
+    [
+        ("b_none", "bframes=3:b-pyramid=none:weightb=0:scenecut=0"),
+        ("b_none_cavlc", "bframes=3:b-pyramid=none:scenecut=0:cabac=0"),
+        ("b_normal", "bframes=3:b-pyramid=normal:scenecut=0"),
+        ("b_strict", "bframes=4:b-pyramid=strict:ref=3:scenecut=0"),
+        ("b_temporal_cavlc", "bframes=3:b-pyramid=normal:direct=temporal:scenecut=0:cabac=0"),
+    ]
+    .into_iter()
+    .map(|(name, params)| (name, encode("mandelbrot", 2, &["-pix_fmt", "yuv420p", "-g", "25", "-x264-params", params])))
+    .collect()
+}
+
+/// Render `timeline` and check the result as a decoder sees it: one picture per entry
+/// and no complaints, frame_num and picture order counts in order, and the display
+/// order is the timeline's. Returns the pictures' MD5s.
+fn render_checked(src: &Source, timeline: &Timeline, name: &str) -> Vec<String> {
+    let (out, rep) = render(src, timeline, &RenderOptions::default()).unwrap();
+    let bytes = out.write(false).unwrap();
+    let aus = group_access_units(Stream::parse(&bytes).unwrap().nals);
+    assert_eq!(aus.len(), timeline.entries.len(), "{name}");
+    assert!(verify::frame_num_violations(&aus).is_empty(), "{name}");
+    let poc = verify::poc_check(&aus);
+    assert!(poc.duplicates.is_empty() && poc.reordered_too_far.is_empty(), "{name}: {poc:?}");
+    // the output frame decoded as each access unit
+    let mut by_start: Vec<(usize, usize)> = rep.frames.iter().enumerate().map(|(k, f)| (f.nals.start, k)).collect();
+    by_start.sort();
+    let shown: Vec<usize> = poc.display.iter().map(|&i| by_start[i].1).collect();
+    assert_eq!(shown, (0..timeline.entries.len()).collect::<Vec<_>>(), "{name}: display order");
+    let (md5, err) = decode(&bytes, &format!("{name}.264"));
+    assert!(err.is_empty(), "{name}: {err}");
+    assert_eq!(md5.len(), timeline.entries.len(), "{name}");
+    md5
+}
+
+/// A timeline of input frames given by their display positions.
+fn shown(src: &Source, positions: impl IntoIterator<Item = usize>) -> Timeline {
+    Timeline { entries: positions.into_iter().map(|p| TimelineEntry::new(src.display[p])).collect() }
+}
+
+#[test]
+fn bframe_renumbering_keeps_the_pictures() {
+    if !ffmpeg_available() {
+        return;
+    }
+    for (name, data) in bframe_configs() {
+        let src = Source::new(Stream::parse(&data).unwrap());
+        assert!(src.aus.iter().any(|a| a.picture_type() == 'B'), "{name}");
+        let (orig, _) = decode(&data, "b_orig.264");
+        assert_eq!(orig.len(), src.len());
+        // unchanged: the input as it is
+        let (out, rep) = render(&src, &src.timeline(), &RenderOptions::default()).unwrap();
+        assert_eq!(rep.rewritten, 0);
+        assert_eq!(out.write(false).unwrap(), data, "{name}");
+        // renumbered (the first frame once more at the end): every header comes out the
+        // same, and so do the pictures
+        let mut timeline = src.timeline();
+        timeline.entries.push(TimelineEntry::new(0));
+        let (_, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+        assert_eq!(rep.rewritten, 0, "{name}");
+        let md5 = render_checked(&src, &timeline, name);
+        assert_eq!(md5[..orig.len()], orig[..], "{name}");
+        assert_eq!(md5.last(), orig.first(), "{name}");
+    }
+}
+
+#[test]
+fn bframe_edits_decode_cleanly() {
+    if !ffmpeg_available() {
+        return;
+    }
+    for (name, data) in bframe_configs() {
+        let src = Source::new(Stream::parse(&data).unwrap());
+        let n = src.len();
+        let kind = |p: usize| src.aus[src.display[p]].picture_type();
+        let is_ref = |p: usize| src.aus[src.display[p]].is_reference();
+        let b = (1..n).find(|&p| kind(p) == 'B').unwrap();
+        let p_frame = (n / 2..n).find(|&p| kind(p) == 'P').unwrap();
+        let idr = (1..n).find(|&p| src.aus[src.display[p]].is_idr()).unwrap();
+        let bs: Vec<usize> = (0..n).filter(|&p| kind(p) == 'B').collect();
+        let cases: Vec<(&str, Vec<usize>)> = vec![
+            // a B-frame shown among other frames
+            ("b_moved", (0..b).chain(b + 1..b + 12).chain([b]).chain(b + 12..n).collect()),
+            // a P-frame shown earlier, its B-frames left behind
+            ("p_moved", (0..5).chain([p_frame]).chain(5..p_frame).chain(p_frame + 1..n).collect()),
+            ("reversed", (0..4).chain((4..30).rev()).chain(30..n).collect()),
+            ("repeated", (0..b).chain([b; 8]).chain(b..p_frame).chain([p_frame; 5]).chain(p_frame..n).collect()),
+            ("idr_dropped", (0..idr).chain(idr + 1..n).collect()),
+            ("no_b", (0..n).filter(|&p| kind(p) != 'B').collect()),
+            ("only_b", [0].into_iter().chain(bs.iter().copied()).collect()),
+            // B-frames of the next GOP before its IDR frame
+            ("across_idr", (0..idr).chain(idr + 1..idr + 4).chain([idr]).chain(idr + 4..n).collect()),
+            ("twice", (0..n).chain(0..n).collect()),
+        ];
+        for (case, order) in cases {
+            render_checked(&src, &shown(&src, order), &format!("{name}_{case}"));
+        }
+        // two non-reference B-frames swapped within their group show each other's picture
+        if name == "b_none" {
+            let (orig, _) = decode(&data, "b_orig.264");
+            let p = (1..n - 1).find(|&p| kind(p) == 'B' && kind(p + 1) == 'B' && !is_ref(p) && !is_ref(p + 1)).unwrap();
+            let md5 = render_checked(&src, &shown(&src, (0..p).chain([p + 1, p]).chain(p + 2..n)), "b_swapped");
+            assert_eq!((&md5[p], &md5[p + 1]), (&orig[p + 1], &orig[p]));
+            assert_eq!(md5[..p], orig[..p]);
+            assert_eq!(md5[p + 2..], orig[p + 2..]);
+        }
+    }
+}
+
+/// The GUI decodes from the last IDR frame before the frame it shows; with B-frames
+/// that segment must show the same pictures as the full stream.
+#[test]
+fn bframe_segments_decode_like_the_full_stream() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let (_, data) = bframe_configs().swap_remove(2);
+    let src = Source::new(Stream::parse(&data).unwrap());
+    let n = src.len();
+    let timeline = shown(&src, (0..10).chain((10..40).rev()).chain(40..n));
+    let full = render_checked(&src, &timeline, "b_segment_full");
+    let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+    for k in [5, 20, 30, 45] {
+        let r = rep.restart_point(k);
+        assert!(rep.frames[r].idr && r <= k);
+        let (md5, err) = decode(&segment(&out, &rep.frames, r..n).unwrap(), "b_segment.264");
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(md5, full[r..], "segment from {r}");
+    }
+}
+
+#[test]
+fn prep_can_use_bframes() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let clip = tmp("prep_bframes_in.mp4");
+    let status = Command::new(ffmpeg())
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "mandelbrot=size=320x192:rate=25", "-t", "1", "-c:v", "libx264"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let enc = EncodeSettings {
+        preset: "ultrafast".into(),
+        crf: 23.0,
+        keyint: "250".into(),
+        scenecut: true,
+        cavlc: true,
+        refs: 1,
+        bframes: 3,
+        b_pyramid: BPyramid::None,
+        x264_params: None,
+    };
+    let out = tmp("prep_bframes_out.264");
+    prep(&Tools::find(None), &[clip], &out, None, None, &enc, &mut |_| true).unwrap();
+    let src = Source::new(Stream::parse(&std::fs::read(&out).unwrap()).unwrap());
+    let bs: Vec<_> = src.aus.iter().filter(|a| a.picture_type() == 'B').collect();
+    assert!(!bs.is_empty());
+    assert!(bs.iter().all(|a| !a.is_reference()), "b-pyramid none: no reference B-frames");
+    let n = src.len();
+    render_checked(&src, &shown(&src, (0..3).chain((3..n).rev())), "prep_bframes");
 }

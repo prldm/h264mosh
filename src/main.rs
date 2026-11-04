@@ -5,7 +5,7 @@ use h264mosh::mb::{self, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, decode_pocs, mosh};
 use h264mosh::motion;
 use h264mosh::nal::nal_type_name;
-use h264mosh::pipeline::{self, EncodeSettings, PrepProgress, Tools};
+use h264mosh::pipeline::{self, BPyramid, EncodeSettings, PrepProgress, Tools};
 use h264mosh::range::{DupSpec, RangeSet};
 use h264mosh::slice::SliceType;
 use h264mosh::stream::{AccessUnit, NalKind, Stream, group_access_units};
@@ -64,11 +64,17 @@ enum Cmd {
         /// reference frames per P-frame (more than 1 for --ref-shift)
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=16))]
         refs: u32,
+        /// B-frames between the other frames (frame edits work on them; most effects only on P-frames)
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=16))]
+        bframes: u32,
+        /// B-frames as references for other B-frames (with --bframes)
+        #[arg(long, default_value = "none", value_parser = ["none", "strict", "normal"])]
+        b_pyramid: String,
         /// extra libx264 options in x264-params syntax, e.g. "deblock=0:me=dia"
         #[arg(long, value_name = "K=V:K=V")]
         x264_params: Option<String>,
     },
-    /// Edit frames at the bitstream level (frame numbers are 0-based, decode order)
+    /// Edit frames at the bitstream level (frame numbers are 0-based, decode order; the output keeps display order)
     Mosh {
         input: PathBuf,
         #[arg(short, long)]
@@ -620,8 +626,13 @@ fn main() -> Result<()> {
     }
     let tools = Tools::find(cli.ffmpeg.as_deref());
     match cli.cmd {
-        Cmd::Prep { inputs, output, size, fps, crf, preset, keyint, no_scenecut, cavlc, refs, x264_params } => {
-            let enc = EncodeSettings { preset, crf, keyint, scenecut: !no_scenecut, cavlc, refs, x264_params };
+        Cmd::Prep { inputs, output, size, fps, crf, preset, keyint, no_scenecut, cavlc, refs, bframes, b_pyramid, x264_params } => {
+            let b_pyramid = match b_pyramid.as_str() {
+                "strict" => BPyramid::Strict,
+                "normal" => BPyramid::Normal,
+                _ => BPyramid::None,
+            };
+            let enc = EncodeSettings { preset, crf, keyint, scenecut: !no_scenecut, cavlc, refs, bframes, b_pyramid, x264_params };
             let clips = pipeline::prep(&tools, &inputs, &output, size, fps, &enc, &mut |p| {
                 match p {
                     PrepProgress::Start { width, height, fps, clips } => {

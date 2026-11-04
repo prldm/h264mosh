@@ -203,15 +203,46 @@ pub struct EncodeSettings {
     pub cavlc: bool,
     /// reference frames (1 is the most mosh-friendly; more make reference effects possible)
     pub refs: u32,
+    /// B-frames between the other frames (0: none, the most mosh-friendly)
+    pub bframes: u32,
+    pub b_pyramid: BPyramid,
     /// extra libx264 options, x264-params syntax (key=value:key=value)
     pub x264_params: Option<String>,
 }
 
+/// Whether B-frames can be reference frames for other B-frames (x264 b-pyramid).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BPyramid {
+    #[default]
+    None,
+    Strict,
+    Normal,
+}
+
+impl BPyramid {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BPyramid::None => "none",
+            BPyramid::Strict => "strict",
+            BPyramid::Normal => "normal",
+        }
+    }
+}
+
 impl EncodeSettings {
     fn x264_params(&self) -> String {
-        // mosh-friendly: no reordering, one reference (unless asked), no weighted prediction
-        let mut p =
-            vec!["bframes=0".to_string(), format!("ref={}", self.refs.max(1)), "weightp=0".into(), format!("keyint={}", self.keyint)];
+        // mosh-friendly: no reordering (unless asked), one reference (unless asked), no
+        // weighted prediction
+        let mut p = vec![
+            format!("bframes={}", self.bframes),
+            format!("ref={}", self.refs.max(1)),
+            "weightp=0".into(),
+            format!("keyint={}", self.keyint),
+        ];
+        if self.bframes > 0 {
+            p.push(format!("b-pyramid={}", self.b_pyramid.as_str()));
+        }
         if !self.scenecut {
             p.push("scenecut=0".into());
         }

@@ -276,6 +276,38 @@ impl Sps {
         1 << self.log2_max_poc_lsb()
     }
 
+    /// MaxDpbFrames of the level (A.3.1 h, Table A-1): frames the decoded picture buffer
+    /// can hold at this picture size. Unknown levels get the largest buffer.
+    pub fn max_dpb_frames(&self) -> u32 {
+        let set3 = self.constraint_flags & 0x10 != 0;
+        let mbs = match self.level_idc {
+            9 | 10 => 396,
+            11 if set3 && matches!(self.profile_idc, 66 | 77 | 88) => 396,
+            11 => 900,
+            12 | 13 | 20 => 2376,
+            21 => 4752,
+            22 | 30 => 8100,
+            31 => 18000,
+            32 => 20480,
+            40 | 41 => 32768,
+            42 => 34816,
+            50 => 110400,
+            51 | 52 => 184320,
+            _ => 696320,
+        };
+        (mbs / (self.pic_width_in_mbs() * self.frame_height_in_mbs()).max(1)).clamp(1, 16)
+    }
+
+    /// (max_num_reorder_frames, max_dec_frame_buffering), inferred when not signalled (E.2.1).
+    pub fn reorder_limits(&self) -> (u32, u32) {
+        if let Some(b) = self.vui.as_ref().and_then(|v| v.bitstream_restriction.as_ref()) {
+            return (b.max_num_reorder_frames, b.max_dec_frame_buffering);
+        }
+        let intra_only = matches!(self.profile_idc, 44 | 86 | 100 | 110 | 122 | 244) && self.constraint_flags & 0x10 != 0;
+        let n = if intra_only { 0 } else { self.max_dpb_frames() };
+        (n, n)
+    }
+
     pub fn chroma_array_type(&self) -> u32 {
         if self.separate_colour_plane_flag { 0 } else { self.chroma_format_idc }
     }

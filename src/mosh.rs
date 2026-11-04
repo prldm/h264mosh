@@ -1,10 +1,12 @@
 //! Datamosh edits.
 //!
-//! An edit is a [`Timeline`]: the list of output frames, each one showing an input
-//! frame (by decode-order index) with optional macroblock effects. Frames can be
-//! dropped, repeated and reordered freely. [`render`] turns a timeline into a
-//! conformant stream: parameter sets are re-inserted where needed, frame_num (and
-//! POC for pic_order_cnt_type 0) are renumbered, and effects are applied.
+//! An edit is a [`Timeline`]: the list of output frames in display order, each one
+//! showing an input frame (by decode-order index) with optional macroblock effects.
+//! Frames can be dropped, repeated and reordered freely, B-frames included. [`render`]
+//! turns a timeline into a conformant stream: the frames are put in a decoding order,
+//! parameter sets are re-inserted where needed, frame_num, POC (pic_order_cnt_type 0),
+//! reference lists and marking are renumbered (see [`crate::renumber`]), and effects
+//! are applied.
 //! [`MoshPlan`] is the range-based description used by the command line; it is
 //! compiled into a timeline.
 
@@ -14,7 +16,8 @@ use crate::nal::{NAL_IDR, NAL_PPS, NAL_SPS, NalHeader, START_CODE};
 use crate::poc::PocDecoder;
 use crate::pps::Pps;
 use crate::range::{DupSpec, RangeSet};
-use crate::slice::{DecRefPicMarking, RplmOp, SliceType};
+use crate::renumber::{self, SpsNeeds, Targets};
+use crate::slice::{DecRefPicMarking, Mmco, SliceType};
 use crate::sps::Sps;
 use crate::stream::{AccessUnit, Nal, NalKind, Stream, group_access_units};
 use anyhow::{Context, Result, bail};
@@ -29,6 +32,12 @@ pub struct Source {
     pub aus: Vec<AccessUnit>,
     /// picture order count of each frame
     pub pocs: Vec<Option<i64>>,
+    /// input frames in display order
+    pub display: Vec<usize>,
+    /// position of each input frame in `display`
+    pub(crate) display_pos: Vec<usize>,
+    /// what the reference list modifications and marking of each frame refer to
+    pub(crate) refs: Vec<Targets>,
     pub tail: Vec<u8>,
     pub warnings: Vec<String>,
 }
@@ -37,7 +46,18 @@ impl Source {
     pub fn new(stream: Stream) -> Self {
         let aus = group_access_units(stream.nals);
         let pocs = decode_pocs(&aus);
-        Self { aus, pocs, tail: stream.tail, warnings: stream.warnings }
+        let display = display_order(&aus, &pocs);
+        let mut display_pos = vec![0; aus.len()];
+        for (k, &i) in display.iter().enumerate() {
+            display_pos[i] = k;
+        }
+        let refs = renumber::source_targets(&aus, &pocs);
+        Self { aus, pocs, display, display_pos, refs, tail: stream.tail, warnings: stream.warnings }
+    }
+
+    /// Every input frame once, unchanged, in display order.
+    pub fn timeline(&self) -> Timeline {
+        Timeline { entries: self.display.iter().map(|&i| TimelineEntry::new(i)).collect() }
     }
 
     pub fn len(&self) -> usize {
@@ -85,13 +105,15 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    /// Every input frame once, unchanged.
+    /// Every input frame once, unchanged, for a stream without B-frames (see
+    /// [`Source::timeline`]).
     pub fn identity(frames: usize) -> Self {
         Self { entries: (0..frames).map(TimelineEntry::new).collect() }
     }
 
-    fn keeps_order(&self, frames: usize) -> bool {
-        self.entries.len() == frames && self.entries.iter().enumerate().all(|(i, e)| e.src == i)
+    /// Shows every input frame of `src` once, in its display order.
+    fn keeps_order(&self, src: &Source) -> bool {
+        self.entries.len() == src.len() && self.entries.iter().zip(&src.display).all(|(e, &i)| e.src == i)
     }
 }
 
@@ -108,13 +130,15 @@ pub struct RenderedFrame {
     pub src: usize,
     /// decoding can (re)start at this frame
     pub idr: bool,
-    /// its NAL units in the output stream (see `Stream::write_with_offsets`)
+    /// its NAL units in the output stream (see `Stream::write_with_offsets`); with
+    /// B-frames the stream is in decoding order, not in display order
     pub nals: Range<usize>,
 }
 
 #[derive(Default, Debug)]
 pub struct RenderReport {
     pub frames_out: usize,
+    /// the output frames in display order (the timeline's)
     pub frames: Vec<RenderedFrame>,
     /// frames whose headers or data were rewritten
     pub rewritten: usize,
@@ -134,7 +158,8 @@ impl RenderReport {
 
 struct OutFrame {
     src: usize,
-    orig_poc: Option<i64>,
+    /// timeline entry
+    pos: usize,
     au: AccessUnit,
 }
 
@@ -148,18 +173,24 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
     if let Some(i) = src.aus.iter().position(|au| au.has_unparsed_vcl()) {
         bail!("frame {i} contains slices that could not be parsed; cannot edit this stream");
     }
-    let reordered = !timeline.keeps_order(src.len());
-    if reordered {
-        check_editable(&src.aus, &src.pocs, &mut report.warnings)?;
+    let reordered = !timeline.keeps_order(src);
+    let (order, plan) = if reordered {
+        check_editable(src, &mut report.warnings)?;
         if !src.aus[first.src].is_idr() {
             bail!("the output must start with an IDR frame (frame {} is not one)", first.src);
         }
-    }
+        let (order, plan) = plan_decoding(src, timeline)?;
+        (order, Some(plan))
+    } else {
+        (src.display_pos.clone(), None)
+    };
 
+    // first uses in decoding order take the whole access unit
     let mut used = vec![false; src.len()];
     let mut params = ParamSets::default();
     let mut out = Vec::with_capacity(timeline.entries.len());
-    for e in &timeline.entries {
+    for &pos in &order {
+        let e = &timeline.entries[pos];
         let orig = &src.aus[e.src];
         // the first use takes the whole access unit, repeats only the coded picture
         let mut au = if std::mem::replace(&mut used[e.src], true) {
@@ -170,14 +201,26 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
             orig.clone()
         };
         params.prepare(&mut au).with_context(|| format!("frame {}", e.src))?;
-        out.push(OutFrame { src: e.src, orig_poc: src.pocs[e.src], au });
+        out.push(OutFrame { src: e.src, pos, au });
     }
 
-    if reordered {
-        renumber(&mut out);
+    if let Some(plan) = plan {
+        for (f, headers) in out.iter_mut().zip(plan.headers) {
+            let mut headers = headers.into_iter();
+            for n in f.au.nals.iter_mut() {
+                if let Some(s) = n.slice_mut()
+                    && let Some(h) = headers.next()
+                    && s.header != h
+                {
+                    s.header = h;
+                    n.dirty = true;
+                }
+            }
+        }
+        upgrade_sps(&mut out, plan.needs);
     }
     // stream-level preconditions (e.g. CABAC) fail the whole render, not every frame
-    if let Some((f, _)) = out.iter().zip(&timeline.entries).find(|(_, e)| e.effects.iter().any(|x| x.effect.needs_macroblocks()))
+    if let Some(f) = out.iter().find(|f| timeline.entries[f.pos].effects.iter().any(|x| x.effect.needs_macroblocks()))
         && let Some(s) = f.au.first_slice()
     {
         MbContext::new(s)?;
@@ -191,20 +234,23 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
     // belong to the entries, so the result does not depend on scheduling
     let results: Vec<_> = out
         .par_iter()
-        .zip(timeline.entries.par_iter())
         .enumerate()
-        .filter(|(_, (_, e))| !e.effects.is_empty())
-        .map(|(k, (f, e))| (k, apply_frame_effects(&f.au, &e.effects, e.seed, &donors)))
+        .filter(|(_, f)| !timeline.entries[f.pos].effects.is_empty())
+        .map(|(j, f)| {
+            let e = &timeline.entries[f.pos];
+            (j, apply_frame_effects(&f.au, &e.effects, e.seed, &donors))
+        })
         .collect();
-    for (k, result) in results {
+    for (j, result) in results {
         match result {
             Ok((au, stats)) => {
-                out[k].au = au;
+                out[j].au = au;
                 report.effects += stats;
             }
-            Err(reason) => report.failed_effects.push((k, format!("frame {}: {reason}", timeline.entries[k].src))),
+            Err(reason) => report.failed_effects.push((out[j].pos, format!("frame {}: {reason}", out[j].src))),
         }
     }
+    report.failed_effects.sort_by_key(|(k, _)| *k);
     if opts.no_deblock {
         disable_deblocking(&mut out);
     }
@@ -212,27 +258,46 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
     report.frames_out = out.len();
     report.rewritten = out.iter().filter(|f| f.au.nals.iter().any(|n| n.dirty)).count();
     let mut nals = Vec::new();
+    let mut frames = vec![None; out.len()];
     for f in out {
         let start = nals.len();
         nals.extend(f.au.nals);
-        report.frames.push(RenderedFrame {
-            src: f.src,
-            idr: nals[start..].iter().any(|n| n.nal_type() == NAL_IDR),
-            nals: start..nals.len(),
-        });
+        frames[f.pos] =
+            Some(RenderedFrame { src: f.src, idr: nals[start..].iter().any(|n| n.nal_type() == NAL_IDR), nals: start..nals.len() });
     }
+    report.frames = frames.into_iter().map(|f| f.expect("every timeline entry is rendered")).collect();
     Ok((Stream { nals, tail: src.tail.clone(), warnings: Vec::new() }, report))
+}
+
+/// The decoding order of an edited timeline and its new headers. B-frames wait for the
+/// frame after them as long as the decoder can hold the frames that have to wait to be
+/// shown; with too many of them in a row, fewer wait.
+fn plan_decoding(src: &Source, timeline: &Timeline) -> Result<(Vec<usize>, renumber::Plan)> {
+    let sps = &src.aus[timeline.entries[0].src].first_slice().context("the first frame has no slices")?.sps;
+    let limit = sps.max_dpb_frames().max(sps.reorder_limits().1).max(sps.max_num_ref_frames);
+    let mut max_pending = timeline.entries.len();
+    loop {
+        let order = renumber::schedule(src, timeline, max_pending);
+        let plan = renumber::plan(src, timeline, &order)?;
+        if plan.needs.dpb_frames <= limit || max_pending == 0 {
+            return Ok((order, plan));
+        }
+        max_pending /= 2;
+    }
 }
 
 /// Bytes of the rendered output frames `range`, decodable on their own when
 /// `range.start` is an IDR frame (see `RenderReport::restart_point`): the parameter
-/// sets in effect at that point are written first.
+/// sets in effect at that point are written first. With B-frames, frames decoded
+/// together with the range (the one after its last B-frames) come along.
 pub fn segment(stream: &Stream, frames: &[RenderedFrame], range: Range<usize>) -> Result<Vec<u8>> {
-    let (Some(first), Some(last)) = (frames.get(range.start), range.end.checked_sub(1).and_then(|e| frames.get(e))) else {
+    if range.is_empty() || range.end > frames.len() {
         bail!("frame range {range:?} is outside the {} rendered frames", frames.len());
-    };
+    }
+    let start = frames[range.clone()].iter().map(|f| f.nals.start).min().unwrap_or(0);
+    let end = frames[range].iter().map(|f| f.nals.end).max().unwrap_or(0);
     let mut active: HashMap<(u8, u32), &Nal> = HashMap::new();
-    for n in &stream.nals[..first.nals.start] {
+    for n in &stream.nals[..start] {
         match &n.kind {
             NalKind::Sps(s) => active.insert((NAL_SPS, s.sps_id), n),
             NalKind::Pps(p) => active.insert((NAL_PPS, p.pps_id), n),
@@ -245,7 +310,7 @@ pub fn segment(stream: &Stream, frames: &[RenderedFrame], range: Range<usize>) -
     for (_, n) in sets {
         n.write_to(&mut out, false)?;
     }
-    for n in &stream.nals[first.nals.start..last.nals.end] {
+    for n in &stream.nals[start..end] {
         n.write_to(&mut out, false)?;
     }
     Ok(out)
@@ -309,30 +374,52 @@ pub fn decode_pocs(aus: &[AccessUnit]) -> Vec<Option<i64>> {
         .collect()
 }
 
-/// Renumbering assumes progressive frames in display order.
-fn check_editable(aus: &[AccessUnit], pocs: &[Option<i64>], warnings: &mut Vec<String>) -> Result<()> {
-    let mut mmco_warned = false;
-    for (i, au) in aus.iter().enumerate() {
-        if !mmco_warned
-            && au.slices().any(|s| matches!(&s.header.dec_ref_pic_marking, Some(DecRefPicMarking::NonIdr(Some(ops))) if !ops.is_empty()))
-        {
-            warnings.push(format!(
-                "frame {i} uses explicit reference marking (MMCO); after edits these may point at other frames than intended"
-            ));
-            mmco_warned = true;
+/// Input frames in display order: by picture order count, which starts over at IDR
+/// frames and at frames with MMCO 5 (8.2.1).
+pub fn display_order(aus: &[AccessUnit], pocs: &[Option<i64>]) -> Vec<usize> {
+    let mut period = 0;
+    let mut last = 0;
+    let mut keys: Vec<(usize, i64, usize)> = aus
+        .iter()
+        .enumerate()
+        .map(|(i, au)| {
+            let reset = au.first_slice().is_some_and(|s| s.header.has_mmco5());
+            if au.is_idr() || reset {
+                period += 1;
+            }
+            // a frame with MMCO 5 counts as 0 once it is decoded
+            last = if reset { 0 } else { pocs[i].unwrap_or(last) };
+            (period, last, i)
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.into_iter().map(|(_, _, i)| i).collect()
+}
+
+/// Renumbering needs progressive frames, and moving B-frames a picture order count of
+/// type 0. Long-term reference frames are not followed.
+fn check_editable(src: &Source, warnings: &mut Vec<String>) -> Result<()> {
+    let mut long_term_warned = false;
+    for (i, au) in src.aus.iter().enumerate() {
+        let long_term = au.slices().any(|s| match &s.header.dec_ref_pic_marking {
+            Some(DecRefPicMarking::NonIdr(Some(ops))) => ops.iter().any(|op| !matches!(op, Mmco::ForgetShort(_) | Mmco::Reset)),
+            Some(DecRefPicMarking::Idr { long_term_reference_flag, .. }) => *long_term_reference_flag,
+            _ => false,
+        });
+        if long_term && !long_term_warned {
+            warnings.push(format!("frame {i} uses long-term reference frames; after edits these may point at other frames than intended"));
+            long_term_warned = true;
         }
         if au.slices().any(|s| !s.sps.frame_mbs_only_flag) {
             bail!("interlaced streams are not supported (frame {i}); re-encode progressive");
         }
-        if au.picture_type() == 'B' {
-            bail!("frame {i} is a B-frame; frame editing needs a stream without B-frames (x264 --bframes 0, see `h264mosh prep`)");
-        }
-        if i > 0
-            && !au.is_idr()
-            && let (Some(a), Some(b)) = (pocs[i - 1], pocs[i])
-            && b <= a
+        if au.picture_type() == 'B'
+            && let Some(s) = au.slices().find(|s| s.sps.pic_order_cnt_type != 0)
         {
-            bail!("frame {i} is reordered (POC {b} after {a}); frame editing needs display order == decode order");
+            bail!(
+                "frame {i} is a B-frame in a stream with picture order count type {}; editing B-frames needs type 0",
+                s.sps.pic_order_cnt_type
+            );
         }
     }
     Ok(())
@@ -404,132 +491,36 @@ fn param_set_nal(nal_unit_type: u8, kind: NalKind) -> Nal {
     }
 }
 
-fn renumber(out: &mut [OutFrame]) {
-    let mut prev_ref_frame_num = 0u32;
-    let mut poc = 0i64;
-    let mut prev_src: Option<(usize, i64)> = None;
-    let mut last_step = 2i64;
-    let mut prev_idr_pic_id: Option<u32> = None;
-    // short-term reference frames a decoder holds after the previous frame (frame_num, oldest first)
-    let mut dpb: Vec<u32> = Vec::new();
+/// Raise the limits of every SPS to what the renumbered stream needs; slices are
+/// re-serialized when their header syntax changes with it.
+fn upgrade_sps(out: &mut [OutFrame], needs: SpsNeeds) {
+    // the old Arc is kept in the map so its address cannot be reused while we key on it
+    let mut replaced: HashMap<*const Sps, (Arc<Sps>, Arc<Sps>)> = HashMap::new();
+    let mut upgrade = |sps: &Arc<Sps>| -> Arc<Sps> {
+        let new = || needs.upgrade(sps).map_or_else(|| sps.clone(), Arc::new);
+        replaced.entry(Arc::as_ptr(sps)).or_insert_with(|| (sps.clone(), new())).1.clone()
+    };
     for f in out.iter_mut() {
-        let Some(first) = f.au.first_slice() else { continue };
-        let sps = first.sps.clone();
-        let idr = f.au.is_idr();
-        let is_ref = f.au.is_reference();
-        let mmco5 = first.header.has_mmco5();
-        // consecutive IDR pictures need different idr_pic_id values
-        let idr_pic_id = match prev_idr_pic_id {
-            Some(p) if idr && p == first.header.idr_pic_id => (p + 1) % 65536,
-            _ => first.header.idr_pic_id,
-        };
-        if idr {
-            prev_ref_frame_num = 0;
-            poc = f.orig_poc.unwrap_or(0);
-        } else {
-            // keep the original POC spacing between frames that are still adjacent
-            if let (Some((ps, pp)), Some(p)) = (prev_src, f.orig_poc)
-                && ps + 1 == f.src
-                && p > pp
-            {
-                last_step = p - pp;
-            }
-            poc += last_step;
-        }
-        prev_src = f.orig_poc.map(|p| (f.src, p));
-        prev_idr_pic_id = idr.then_some(idr_pic_id);
-        let frame_num = if idr { 0 } else { (prev_ref_frame_num + 1) % sps.max_frame_num() };
-        let poc_lsb = poc.rem_euclid(sps.max_poc_lsb() as i64) as u32;
-        if idr {
-            dpb.clear();
-        }
         for n in f.au.nals.iter_mut() {
-            let Some(s) = n.slice_mut() else { continue };
-            let h = &mut s.header;
-            let mut changed = false;
-            if !idr && h.frame_num != frame_num {
-                h.frame_num = frame_num;
-                changed = true;
+            match &mut n.kind {
+                NalKind::Sps(s) => {
+                    let new = upgrade(s);
+                    if !Arc::ptr_eq(s, &new) {
+                        *s = new;
+                        n.dirty = true;
+                    }
+                }
+                NalKind::Slice(s) => {
+                    let new = upgrade(&s.sps);
+                    if !Arc::ptr_eq(&s.sps, &new) {
+                        n.dirty |= new.log2_max_poc_lsb() != s.sps.log2_max_poc_lsb();
+                        s.sps = new;
+                    }
+                }
+                _ => {}
             }
-            if !idr && s.sps.pic_order_cnt_type == 0 && h.pic_order_cnt_lsb != poc_lsb {
-                h.pic_order_cnt_lsb = poc_lsb;
-                changed = true;
-            }
-            if idr && h.idr_pic_id != idr_pic_id {
-                h.idr_pic_id = idr_pic_id;
-                changed = true;
-            }
-            // a moved frame may use more reference indices than there are frames to
-            // refer to, or modify its list with pictures that are not there
-            let active = h.num_ref_idx_l0_active_minus1 as usize + 1;
-            if matches!(h.slice_type(), SliceType::P | SliceType::SP)
-                && !dpb.is_empty()
-                && !ref_list_complete(&dpb, h.rplm_l0.as_deref(), frame_num, active, sps.max_frame_num())
-            {
-                h.rplm_l0 = (active > dpb.len()).then(|| fill_ref_list(&dpb, frame_num, active, sps.max_frame_num()));
-                changed = true;
-            }
-            n.dirty |= changed;
-        }
-        if is_ref && !idr {
-            prev_ref_frame_num = frame_num;
-        }
-        if is_ref {
-            if dpb.len() >= sps.max_num_ref_frames.max(1) as usize {
-                dpb.remove(0);
-            }
-            dpb.push(frame_num);
-        }
-        if mmco5 {
-            prev_ref_frame_num = 0;
-            poc = 0;
-            dpb = vec![0];
         }
     }
-}
-
-/// Whether the reference list of a P frame (8.2.4.2.1, modified by `ops` as in
-/// 8.2.4.3.1) has a picture for each of its `active` entries when the decoder holds
-/// the short-term frames `dpb` (frame_num, oldest first). Lists with long-term
-/// pictures are not checked.
-fn ref_list_complete(dpb: &[u32], ops: Option<&[RplmOp]>, frame_num: u32, active: usize, max_frame_num: u32) -> bool {
-    let mut list: Vec<Option<u32>> = dpb.iter().rev().map(|&f| Some(f)).take(active).collect();
-    list.resize(active, None);
-    let mut pred = frame_num;
-    for (i, &(idc, v)) in ops.unwrap_or_default().iter().enumerate() {
-        let pic = match idc {
-            _ if v >= max_frame_num => return false,
-            0 => (pred + max_frame_num - (v + 1)) % max_frame_num,
-            1 => (pred + v + 1) % max_frame_num,
-            _ => return true,
-        };
-        if !dpb.contains(&pic) || i >= active {
-            return false;
-        }
-        pred = pic;
-        // insert at index i, drop the later copies of the same picture
-        list.insert(i, Some(pic));
-        let rest: Vec<_> = list.drain(i + 1..).filter(|&p| p != Some(pic)).collect();
-        list.extend(rest);
-        list.resize(active, None);
-    }
-    list.iter().all(Option::is_some)
-}
-
-/// ref_pic_list_modification for a P slice that uses `active` reference indices while
-/// the decoder holds only the frames `dpb` (frame_num, oldest first): the list in its
-/// initial order (most recent first), the missing entries repeating the oldest frame.
-fn fill_ref_list(dpb: &[u32], frame_num: u32, active: usize, max_frame_num: u32) -> Vec<RplmOp> {
-    let mut pred = frame_num;
-    (0..active)
-        .map(|i| {
-            let pic = dpb[dpb.len() - 1 - i.min(dpb.len() - 1)];
-            // a difference of MaxPicNum wraps around to the same picture
-            let diff = (pred + max_frame_num - pic) % max_frame_num;
-            pred = pic;
-            (0, if diff == 0 { max_frame_num } else { diff } - 1)
-        })
-        .collect()
 }
 
 /// Switch PPS flags on in the whole stream (`needs`); slices referring to a changed
@@ -615,7 +606,8 @@ pub struct MoshReport {
 impl MoshPlan {
     pub fn timeline(&self, src: &Source, report: &mut MoshReport) -> Timeline {
         let mut entries = Vec::new();
-        for (i, au) in src.aus.iter().enumerate() {
+        for &i in &src.display {
+            let au = &src.aus[i];
             let in_drop = self.drop.as_ref().is_some_and(|r| r.contains(i));
             let drop = in_drop || (au.is_keyframe() && self.drop_keyframes.as_ref().is_some_and(|r| r.contains(i)));
             if drop && i == 0 {
@@ -658,34 +650,6 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
-
-    #[test]
-    fn missing_references_repeat_the_oldest_frame() {
-        // frames 6 and 7 held, frame 8 refers to four: 7, 6, 6, 6
-        assert_eq!(fill_ref_list(&[6, 7], 8, 4, 16), [(0, 0), (0, 0), (0, 15), (0, 15)]);
-        // across the frame_num wrap: 15 then 0, current 1
-        assert_eq!(fill_ref_list(&[15, 0], 1, 2, 16), [(0, 0), (0, 0)]);
-        assert_eq!(fill_ref_list(&[14], 2, 2, 16), [(0, 3), (0, 15)]);
-        for (dpb, cur, active) in [(&[6, 7][..], 8, 4), (&[15, 0], 1, 3), (&[14], 2, 2)] {
-            assert!(!ref_list_complete(dpb, None, cur, active, 16));
-            assert!(ref_list_complete(dpb, Some(&fill_ref_list(dpb, cur, active, 16)), cur, active, 16));
-        }
-    }
-
-    #[test]
-    fn reference_lists_are_checked_against_the_held_frames() {
-        // frames 3, 4, 5 held, current 6: the initial list is 5, 4, 3
-        assert!(ref_list_complete(&[3, 4, 5], None, 6, 3, 16));
-        assert!(!ref_list_complete(&[4, 5], None, 6, 3, 16));
-        // move 3 to the front: 3, 5, 4
-        assert!(ref_list_complete(&[3, 4, 5], Some(&[(0, 2)]), 6, 3, 16));
-        // refers to frame 2, which is gone
-        assert!(!ref_list_complete(&[3, 4, 5], Some(&[(0, 3)]), 6, 3, 16));
-        // the same picture twice, then the next one: 5, 5, 4
-        assert!(ref_list_complete(&[4, 5], Some(&[(0, 0), (0, 15), (0, 0)]), 6, 3, 16));
-        // two copies of 5 and nothing for the third entry
-        assert!(!ref_list_complete(&[5], Some(&[(0, 0), (0, 15)]), 6, 3, 16));
-    }
 
     #[test]
     fn edit_model_can_move_to_worker_threads() {
