@@ -2,10 +2,10 @@
 //! tests are skipped (with a message) when ffmpeg is not available.
 
 use h264mosh::effects::{Fx, Mask, MbEffect};
-use h264mosh::mb::{Blk, Macroblock, MbContext, MbType};
+use h264mosh::mb::{self, Blk, Macroblock, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
 use h264mosh::motion::{Fields, MbMotion};
-use h264mosh::pipeline::{BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
+use h264mosh::pipeline::{BPyramid, Cancelled, EncodeSettings, Healing, Motion, PrepProgress, Style, Tools, decode_rgba, prep, remux};
 use h264mosh::pps::Pps;
 use h264mosh::residual::Scaling;
 use h264mosh::slice::{SliceDataBits, SliceType};
@@ -1164,6 +1164,57 @@ fn prep_can_use_bframes() {
     assert!(bs.iter().all(|a| !a.is_reference()), "b-pyramid none: no reference B-frames");
     let n = src.len();
     render_checked(&src, &shown(&src, (0..3).chain((3..n).rev())), "prep_bframes");
+}
+
+/// The mosh style reaches the encoder: flowing motion gives P-frames one vector per
+/// macroblock, healing slower than fast keeps intra 4x4/8x8 blocks out of P- and
+/// B-frames, and B-frames take their motion from the colocated picture (temporal direct).
+#[test]
+fn prep_applies_the_mosh_style() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let clip = tmp("prep_style_in.mp4");
+    let status = Command::new(ffmpeg())
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "mandelbrot=size=320x192:rate=25", "-t", "1", "-c:v", "libx264"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let style = Style::default();
+    assert_eq!(style, Style { motion: Motion::Flowing, healing: Healing::Normal });
+    let enc = EncodeSettings {
+        preset: "fast".into(),
+        crf: style.crf(),
+        keyint: "250".into(),
+        scenecut: true,
+        cavlc: true,
+        refs: 1,
+        bframes: 2,
+        b_pyramid: BPyramid::None,
+        x264_params: Some(style.x264_params(2)),
+    };
+    let out = tmp("prep_style_out.264");
+    prep(&Tools::find(None), &[clip], &out, None, None, &enc, &mut |_| true).unwrap();
+    let stream = Stream::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let (mut p, mut b) = (0, 0);
+    for s in stream.nals.iter().filter_map(|n| n.slice()) {
+        let mbs = mb::parse_slice_data(s).unwrap().mbs;
+        match s.header.slice_type() {
+            SliceType::P => {
+                p += 1;
+                let bad = mbs.iter().find(|m| !matches!(m.mb_type, MbType::Skip | MbType::P(0) | MbType::I16x16(_)));
+                assert!(bad.is_none(), "P-frames code 16x16 motion only: {:?}", bad.map(|m| m.mb_type));
+            }
+            SliceType::B => {
+                b += 1;
+                assert!(!s.header.direct_spatial_mv_pred_flag, "temporal direct");
+                assert!(mbs.iter().all(|m| m.mb_type != MbType::INxN), "no intra 4x4/8x8 blocks in B-frames");
+            }
+            _ => {}
+        }
+    }
+    assert!(p > 0 && b > 0, "{p} P and {b} B slices");
 }
 
 /// Copied into a container, a stream with B-frames keeps every picture in its place.

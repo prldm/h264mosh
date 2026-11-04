@@ -5,7 +5,7 @@ use h264mosh::mb::{self, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, decode_pocs, display_order, mosh};
 use h264mosh::motion::{self, BContext, Fields};
 use h264mosh::nal::nal_type_name;
-use h264mosh::pipeline::{self, BPyramid, EncodeSettings, PrepProgress, Tools};
+use h264mosh::pipeline::{self, BPyramid, EncodeSettings, Healing, Motion, PrepProgress, Style, Tools};
 use h264mosh::range::{DupSpec, RangeSet};
 use h264mosh::refs;
 use h264mosh::slice::SliceType;
@@ -49,8 +49,15 @@ enum Cmd {
         /// frame rate, e.g. 25 or 24000/1001 (default: rate of the first input)
         #[arg(long)]
         fps: Option<String>,
-        #[arg(long, default_value_t = 18.0)]
-        crf: f32,
+        /// how motion is analysed: flowing (whole blocks move together), balanced, detailed (small blocks, busier)
+        #[arg(long, default_value = "flowing", value_parser = ["flowing", "balanced", "detailed"])]
+        motion: String,
+        /// how quickly the picture comes back after a dropped keyframe: slow, normal, fast (also in small squares)
+        #[arg(long, default_value = "normal", value_parser = ["slow", "normal", "fast"])]
+        healing: String,
+        /// rate factor (default: from --healing, slow 26, normal 21, fast 16)
+        #[arg(long)]
+        crf: Option<f32>,
         #[arg(long, default_value = "medium")]
         preset: String,
         /// maximum keyframe interval ("infinite" allowed)
@@ -71,7 +78,7 @@ enum Cmd {
         /// B-frames as references for other B-frames (with --bframes)
         #[arg(long, default_value = "none", value_parser = ["none", "strict", "normal"])]
         b_pyramid: String,
-        /// extra libx264 options in x264-params syntax, e.g. "deblock=0:me=dia"
+        /// extra libx264 options in x264-params syntax, e.g. "deblock=0:me=hex" (they override --motion and --healing)
         #[arg(long, value_name = "K=V:K=V")]
         x264_params: Option<String>,
     },
@@ -665,12 +672,42 @@ fn main() -> Result<()> {
     }
     let tools = Tools::find(cli.ffmpeg.as_deref());
     match cli.cmd {
-        Cmd::Prep { inputs, output, size, fps, crf, preset, keyint, no_scenecut, cavlc, refs, bframes, b_pyramid, x264_params } => {
+        Cmd::Prep {
+            inputs,
+            output,
+            size,
+            fps,
+            motion,
+            healing,
+            crf,
+            preset,
+            keyint,
+            no_scenecut,
+            cavlc,
+            refs,
+            bframes,
+            b_pyramid,
+            x264_params,
+        } => {
             let b_pyramid = match b_pyramid.as_str() {
                 "strict" => BPyramid::Strict,
                 "normal" => BPyramid::Normal,
                 _ => BPyramid::None,
             };
+            let motion = match motion.as_str() {
+                "balanced" => Motion::Balanced,
+                "detailed" => Motion::Detailed,
+                _ => Motion::Flowing,
+            };
+            let healing = match healing.as_str() {
+                "slow" => Healing::Slow,
+                "fast" => Healing::Fast,
+                _ => Healing::Normal,
+            };
+            let style = Style { motion, healing };
+            let crf = crf.unwrap_or(style.crf());
+            // later options win, so the user's own come last
+            let x264_params = Some(std::iter::once(style.x264_params(bframes)).chain(x264_params).collect::<Vec<_>>().join(":"));
             let enc = EncodeSettings { preset, crf, keyint, scenecut: !no_scenecut, cavlc, refs, bframes, b_pyramid, x264_params };
             let clips = pipeline::prep(&tools, &inputs, &output, size, fps, &enc, &mut |p| {
                 match p {

@@ -231,8 +231,98 @@ impl BPyramid {
     }
 }
 
+/// How an encode moshes, as two human scales mapped onto libx264 options. Measured on
+/// film footage (motion vector fields of P- and B-frames, and keyframe-dropped decodes):
+/// x264's own analysis gives noisy vectors and many intra blocks in P- and B-frames,
+/// which make moshed areas heal in squares at random places.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Style {
+    pub motion: Motion,
+    pub healing: Healing,
+}
+
+/// How finely motion is analysed: coarser analysis gives smoother, steadier vector fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Motion {
+    /// one vector per 16x16 macroblock, small search: blocks move together
+    #[default]
+    Flowing,
+    /// 8x8 partitions, x264's usual search
+    Balanced,
+    /// down to 4x4 partitions and a wide search, which also locks on to noise
+    Detailed,
+}
+
+/// How quickly the real picture comes back after a dropped keyframe: through residual
+/// (rate) and through intra blocks in P- and B-frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Healing {
+    Slow,
+    #[default]
+    Normal,
+    /// also intra 4x4/8x8 blocks in P- and B-frames (about 3x as many intra blocks)
+    Fast,
+}
+
+impl Motion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Motion::Flowing => "flowing",
+            Motion::Balanced => "balanced",
+            Motion::Detailed => "detailed",
+        }
+    }
+}
+
+impl Healing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Healing::Slow => "slow",
+            Healing::Normal => "normal",
+            Healing::Fast => "fast",
+        }
+    }
+}
+
+impl Style {
+    pub fn crf(self) -> f32 {
+        match self.healing {
+            Healing::Slow => 26.0,
+            Healing::Normal => 21.0,
+            Healing::Fast => 16.0,
+        }
+    }
+
+    /// The libx264 options of the style (x264-params syntax) for an encode with
+    /// `bframes` B-frames.
+    pub fn x264_params(self, bframes: u32) -> String {
+        let (inter, me) = match self.motion {
+            Motion::Flowing => ("", "dia"),
+            Motion::Balanced => ("p8x8,b8x8", "hex"),
+            Motion::Detailed => ("p8x8,b8x8,p4x4", "umh"),
+        };
+        let fast = self.healing == Healing::Fast;
+        let intra = if fast { "i4x4,i8x8" } else { "" };
+        let partitions = [inter, intra].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(",");
+        let partitions = if partitions.is_empty() { "none" } else { &partitions };
+        // adaptive quantization spends bits on dark and flat areas, which then keep
+        // repainting themselves; sharper keyframes (ipratio) give the smear more to carry
+        let mut p = format!("partitions={partitions}:me={me}:aq-mode={}:ipratio=2", u8::from(fast));
+        if bframes > 0 {
+            // B-frames take their motion from the next P-frame, scaled: consistent from
+            // frame to frame (spatial direct guesses it from the neighbours)
+            p.push_str(":direct=temporal");
+        }
+        p
+    }
+}
+
 impl EncodeSettings {
-    fn x264_params(&self) -> String {
+    /// All libx264 options, in x264-params syntax.
+    pub fn x264_params(&self) -> String {
         // mosh-friendly: no reordering (unless asked), one reference (unless asked), no
         // weighted prediction
         let mut p = vec![
