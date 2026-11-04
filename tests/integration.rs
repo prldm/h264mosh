@@ -4,6 +4,7 @@
 use h264mosh::effects::{Fx, Mask, MbEffect};
 use h264mosh::mb::{Blk, Macroblock, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
+use h264mosh::motion::{Fields, MbMotion};
 use h264mosh::pipeline::{BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
 use h264mosh::pps::Pps;
 use h264mosh::residual::Scaling;
@@ -236,7 +237,8 @@ fn mosh_edits_bframes_and_keeps_first_frame() {
 /// Apply `effects` to every frame of the stream.
 fn with_effects(data: &[u8], effects: &[MbEffect]) -> Vec<u8> {
     let src = Source::new(Stream::parse(data).unwrap());
-    let mut timeline = Timeline::identity(src.len());
+    // every frame where it is shown (identity() would show B-frames in decoding order)
+    let mut timeline = src.timeline();
     timeline.entries.iter_mut().for_each(|e| e.effects = effects.iter().cloned().map(Fx::from).collect());
     let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
     assert_eq!(rep.effects.slices, src.aus.iter().map(|a| a.slices().count()).sum::<usize>());
@@ -257,6 +259,13 @@ fn motion_prediction_restructure_keeps_pixels() {
         ("testsrc2", "yuv420p", "bframes=0:ref=4:weightp=2:slices=3:partitions=all"),
         ("mandelbrot", "yuv444p", "bframes=0:ref=2:8x8dct=0"),
         ("mandelbrot", "yuv420p", "bframes=0:ref=2:partitions=all"),
+        // B slices: direct prediction (spatial and temporal, colocated pictures P or B),
+        // both lists, B_8x8 with direct sub-macroblocks
+        ("testsrc2", "yuv420p", "bframes=3:b-pyramid=none:direct=spatial:ref=3:partitions=all"),
+        ("mandelbrot", "yuv420p", "bframes=3:b-pyramid=normal:direct=temporal:ref=3:partitions=all"),
+        ("testsrc2", "yuv420p", "bframes=4:b-pyramid=strict:direct=spatial:weightb=1:ref=4:8x8dct=0"),
+        ("mandelbrot", "yuv444p", "bframes=2:direct=temporal:weightb=0"),
+        ("testsrc2", "yuv420p", "bframes=3:b-pyramid=normal:direct=auto:slices=3:ref=2"),
     ];
     for (source, pix, params) in configs {
         for coder in ["0", "1"] {
@@ -286,6 +295,16 @@ fn restructure_keeps_pixels(source: &str, args: &[&str]) {
             assert!(err.is_empty(), "{source} {args:?} {effects:?}: decoder complained: {err}");
             assert_eq!(md5, orig, "{source} {args:?} {effects:?}: pictures changed");
             assert_bit_exact(&out);
+            if effects.contains(&MbEffect::ExplicitSkips) {
+                // B slices too: every motion is coded
+                for s in Stream::parse(&out).unwrap().nals.iter().filter_map(|n| n.slice()) {
+                    let mbs = h264mosh::mb::parse_slice_data(s).unwrap().mbs;
+                    let direct = |m: &Macroblock| {
+                        m.mb_type == MbType::Skip || (s.header.slice_type() == SliceType::B && h264mosh::motion::has_direct(m))
+                    };
+                    assert!(!mbs.iter().any(direct), "{source} {args:?}: a skipped or direct macroblock is left");
+                }
+            }
         }
     }
 }
@@ -1282,8 +1301,69 @@ fn cabac_macroblocks_match_cavlc() {
     }
 }
 
-/// Macroblock effects that work on B slices (all but the motion ones) on B-frame
-/// streams, CABAC and CAVLC.
+/// The motion of every macroblock of every frame (decoding order), as our decoder
+/// reads it.
+fn motions(data: &[u8]) -> Vec<Vec<MbMotion>> {
+    let aus = group_access_units(Stream::parse(data).unwrap().nals);
+    let mut fields = Fields::new(h264mosh::refs::follow(&aus));
+    (0..aus.len()).map(|i| fields.motion(i, &|k| &aus[k]).unwrap().mbs.clone()).collect()
+}
+
+/// Motion effects on B-frames give the motion asked for, read back by our decoder:
+/// each frame's own motion, changed once, also where the pictures it predicts from
+/// (its direct prediction depends on) were changed too.
+#[test]
+fn bframe_motion_effects_reach_their_target() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let scale = |v: i32, s: f32| (v as f32 * s).round() as i32;
+    for (name, data) in bframe_configs() {
+        let src = Source::new(Stream::parse(&data).unwrap());
+        let before = motions(&data);
+        let is_b: Vec<bool> = src.aus.iter().map(|au| au.picture_type() == 'B').collect();
+        let cases: [(&str, MbEffect, bool); 3] = [
+            ("all", MbEffect::MvScale(2.0, -0.5), false),
+            ("b", MbEffect::MvScale(-1.0, 3.0), true),
+            ("refs", MbEffect::RefShift(1), true),
+        ];
+        for (case, effect, b_only) in cases {
+            let mut timeline = src.timeline();
+            for e in timeline.entries.iter_mut().filter(|e| !b_only || is_b[e.src]) {
+                e.effects = vec![effect.clone().into()];
+            }
+            let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+            assert!(rep.failed_effects.is_empty() && rep.warnings.is_empty(), "{name} {case}: {:?} {:?}", rep.failed_effects, rep.warnings);
+            let out = out.write(false).unwrap();
+            let (_, err) = decode(&out, "b_target.264");
+            assert!(err.is_empty(), "{name} {case}: {err}");
+            for (f, (b, a)) in before.iter().zip(motions(&out)).enumerate() {
+                let mut want = b.clone();
+                if !b_only || is_b[f] {
+                    let au = &src.aus[f];
+                    let max =
+                        au.first_slice().map_or([0, 0], |s| [s.header.num_ref_idx_l0_active_minus1, s.header.num_ref_idx_l1_active_minus1]);
+                    for m in want.iter_mut() {
+                        match effect {
+                            MbEffect::MvScale(sx, sy) => m.map_mvs(|v| [scale(v[0], sx), scale(v[1], sy)]),
+                            MbEffect::RefShift(n) => {
+                                for (refs, max) in m.ref_idx.iter_mut().zip(max) {
+                                    refs.iter_mut().filter(|r| **r >= 0).for_each(|r| *r = (*r as i32 + n).clamp(0, max as i32) as i8);
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert!(a == want, "{name} {case}: frame {f} ({}) has other motion", src.aus[f].picture_type());
+            }
+        }
+    }
+}
+
+/// Macroblock effects on B-frame streams (CABAC and CAVLC), motion effects included:
+/// they decode cleanly, change the B-frames too, and leave out only I slices. Frame
+/// 3 is a B-frame (decoding order), so it gives B macroblocks and motion.
 #[test]
 fn bframe_streams_take_macroblock_effects() {
     if !ffmpeg_available() {
@@ -1295,16 +1375,70 @@ fn bframe_streams_take_macroblock_effects() {
         vec![MbEffect::Coeffs(0.3, 0.0), MbEffect::DcShift(20, -20, 20)],
         vec![MbEffect::ZeroResidual],
         vec![MbEffect::MvScale(1.5, 1.5), MbEffect::Transplant(10, 0.5)],
+        vec![MbEffect::MvAdd(23, -11)],
+        vec![MbEffect::MvJitter(16)],
+        vec![MbEffect::KillIntra, MbEffect::MvScale(0.0, 0.0)],
+        vec![MbEffect::ExplicitSkips, MbEffect::SplitTo8x8, MbEffect::MvScale(-1.0, 1.0)],
+        vec![MbEffect::RefShift(2), MbEffect::MvAdd(8, 8)],
+        vec![MbEffect::MotionTransplant(3, 0.5)],
+        vec![MbEffect::Transplant(3, 0.7), MbEffect::MvJitter(8)],
     ];
     for (name, data) in bframe_configs() {
         let (orig, _) = decode(&data, "b_fx_orig.264");
+        let src = Source::new(Stream::parse(&data).unwrap());
+        assert_eq!(src.aus[3].picture_type(), 'B', "{name}");
+        let b_shown: Vec<usize> = (0..src.len()).filter(|&p| src.aus[src.display[p]].picture_type() == 'B').collect();
+        let intra_slices = src.aus.iter().flat_map(|a| a.slices()).filter(|s| s.header.slice_type().is_intra()).count();
         for fx in &effects {
-            let out = with_effects(&data, fx);
+            let mut timeline = src.timeline();
+            timeline.entries.iter_mut().for_each(|e| e.effects = fx.iter().cloned().map(Fx::from).collect());
+            let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+            assert!(rep.failed_effects.is_empty() && rep.warnings.is_empty(), "{name} {fx:?}: {:?} {:?}", rep.failed_effects, rep.warnings);
+            if fx.iter().any(|e| e.needs_motion()) {
+                assert_eq!(rep.effects.slices_without_motion, intra_slices, "{name} {fx:?}");
+            }
+            let out = out.write(false).unwrap();
             let (md5, err) = decode(&out, "b_fx.264");
             assert!(err.is_empty(), "{name} {fx:?}: {err}");
             assert_eq!(md5.len(), orig.len(), "{name} {fx:?}");
-            assert_ne!(md5, orig, "{name} {fx:?} had no visible effect");
+            assert!(b_shown.iter().any(|&p| md5[p] != orig[p]), "{name} {fx:?} changed no B-frame");
             assert_bit_exact(&out);
+        }
+    }
+}
+
+/// Motion effects on B-frames that are moved, and on the frames left after dropping
+/// keyframes: the reference lists and colocated pictures are the edited stream's.
+#[test]
+fn moved_bframes_take_motion_effects() {
+    if !ffmpeg_available() {
+        return;
+    }
+    for (name, data) in bframe_configs() {
+        let src = Source::new(Stream::parse(&data).unwrap());
+        let n = src.len();
+        // the second half first; B-frames swapped with their neighbours
+        let mut positions: Vec<usize> = (0..n).collect();
+        positions.rotate_left(n / 2 - n / 2 % 25);
+        for k in (1..n - 1).step_by(5) {
+            positions.swap(k, k + 1);
+        }
+        let idr_first = positions.iter().position(|&p| src.aus[src.display[p]].is_idr()).unwrap();
+        positions.rotate_left(idr_first);
+        let check = |timeline: &Timeline, case: &str| {
+            let (_, rep) = render(&src, timeline, &RenderOptions::default()).unwrap();
+            assert!(rep.failed_effects.is_empty(), "{name} {case}: {:?}", rep.failed_effects);
+            assert!(!rep.warnings.iter().any(|w| w.contains("left out")), "{name} {case}: {:?}", rep.warnings);
+            render_checked(&src, timeline, &format!("{name}_{case}"));
+        };
+        for fx in [MbEffect::MvScale(2.0, 2.0), MbEffect::MvJitter(12), MbEffect::RefShift(1)] {
+            let mut timeline = shown(&src, positions.iter().copied());
+            timeline.entries.iter_mut().for_each(|e| e.effects = vec![fx.clone().into()]);
+            check(&timeline, "moved");
+            // keyframes after the first dropped
+            let mut timeline = shown(&src, (0..n).filter(|&p| p == 0 || !src.aus[src.display[p]].is_keyframe()));
+            timeline.entries.iter_mut().for_each(|e| e.effects = vec![fx.clone().into()]);
+            check(&timeline, "dropped");
         }
     }
 }

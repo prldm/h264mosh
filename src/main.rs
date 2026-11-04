@@ -3,10 +3,11 @@ use clap::{Args, Parser, Subcommand};
 use h264mosh::effects::{Mask, MbEffect};
 use h264mosh::mb::{self, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, decode_pocs, display_order, mosh};
-use h264mosh::motion;
+use h264mosh::motion::{self, BContext, Fields};
 use h264mosh::nal::nal_type_name;
 use h264mosh::pipeline::{self, BPyramid, EncodeSettings, PrepProgress, Tools};
 use h264mosh::range::{DupSpec, RangeSet};
+use h264mosh::refs;
 use h264mosh::slice::SliceType;
 use h264mosh::stream::{AccessUnit, NalKind, Stream, group_access_units};
 use h264mosh::verify;
@@ -64,7 +65,7 @@ enum Cmd {
         /// reference frames per P-frame (more than 1 for --ref-shift)
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=16))]
         refs: u32,
-        /// B-frames between the other frames (frame edits work on them; most effects only on P-frames)
+        /// B-frames between the other frames (frame edits and effects work on them; --weight and --tint only on P-frames)
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=16))]
         bframes: u32,
         /// B-frames as references for other B-frames (with --bframes)
@@ -142,7 +143,7 @@ enum Cmd {
 }
 
 /// Macroblock effects (not on MBAFF streams; --deblock, --weight and --tint work on any
-/// stream). Motion vector effects apply to P-frames.
+/// stream). Motion vector effects apply to P- and B-frames, --weight and --tint to P-frames.
 #[derive(Args)]
 struct FxArgs {
     /// multiply motion vectors by X (or X:Y)
@@ -157,7 +158,7 @@ struct FxArgs {
     /// multiply the coded motion vector differences by X (or X:Y); errors cascade through prediction
     #[arg(long, value_name = "X[:Y]", value_parser = parse_f32_pair, allow_hyphen_values = true)]
     mvd_scale: Option<(f32, f32)>,
-    /// replace intra macroblocks in P-frames by skipped ones, so moshed areas never heal
+    /// replace intra macroblocks in P- and B-frames by skipped ones, so moshed areas never heal
     #[arg(long)]
     kill_intra: bool,
     /// drop all residual data (pictures from prediction only)
@@ -178,7 +179,7 @@ struct FxArgs {
     /// copy macroblocks of frame FRAME into the same places, a fraction of them (default 1)
     #[arg(long, value_name = "FRAME[:FRACTION]", value_parser = parse_transplant)]
     transplant: Option<(usize, f32)>,
-    /// give P-frames the motion of frame FRAME, mixed with their own (default 1: all of it)
+    /// give P- and B-frames the motion of frame FRAME, mixed with their own (default 1: all of it)
     #[arg(long, value_name = "FRAME[:MIX]", value_parser = parse_transplant)]
     motion_from: Option<(usize, f32)>,
     /// predict from reference frames N frames further back (needs `prep --refs`)
@@ -518,10 +519,12 @@ struct MbStats {
     mean_mv: Option<f64>,
 }
 
-fn frame_mb_stats(au: &AccessUnit) -> Result<MbStats> {
+/// Macroblock statistics of a frame; `contexts` (one per slice) gives the motion of B
+/// slices.
+fn frame_mb_stats(au: &AccessUnit, contexts: Option<&[Option<BContext>]>) -> Result<MbStats> {
     let mut st = MbStats::default();
     let (mut mv_sum, mut mv_n) = (0.0, 0);
-    for s in au.slices() {
+    for (k, s) in au.slices().enumerate() {
         let ctx = MbContext::new(s)?;
         let data = mb::parse_slice_data(s)?;
         for m in &data.mbs {
@@ -531,9 +534,13 @@ fn frame_mb_stats(au: &AccessUnit) -> Result<MbStats> {
                 _ => st.inter += 1,
             }
         }
-        if ctx.slice_type == SliceType::P {
-            for m in motion::decode_motion(&ctx, &data)?.iter().filter(|m| !m.is_intra()) {
-                mv_sum += m.mv.iter().map(|v| ((v[0] * v[0] + v[1] * v[1]) as f64).sqrt() / 4.0).sum::<f64>() / 16.0;
+        let b = contexts.and_then(|c| c.get(k)).and_then(Option::as_ref);
+        if ctx.slice_type == SliceType::P || b.is_some() {
+            for m in motion::decode_motion(&ctx, &data, b)?.iter().filter(|m| !m.is_intra()) {
+                // the mean over the vectors in use, both lists in B slices
+                let used = || (0..2).flat_map(|l| (0..16).map(move |b| (l, b))).filter(|&(l, b)| m.ref_idx[l][b] >= 0);
+                let len = used().map(|(l, b)| m.mv(l, b)).map(|[x, y]| ((x * x + y * y) as f64).sqrt() / 4.0);
+                mv_sum += len.sum::<f64>() / used().count() as f64;
                 mv_n += 1;
             }
         }
@@ -543,9 +550,21 @@ fn frame_mb_stats(au: &AccessUnit) -> Result<MbStats> {
 }
 
 /// Per frame in display order: intra / inter / skipped macroblocks and mean motion of
-/// P-frames.
+/// P- and B-frames.
 fn print_mb_stats(aus: &[AccessUnit], display: &[usize]) {
-    let mut stats: Vec<Option<Result<MbStats>>> = aus.par_iter().map(frame_mb_stats).map(Some).collect();
+    // B-frames' motion depends on the pictures they predict from
+    let b: Vec<usize> = (0..aus.len()).filter(|&i| aus[i].picture_type() == 'B').collect();
+    let mut contexts = vec![None; aus.len()];
+    if !b.is_empty() {
+        let mut fields = Fields::new(refs::follow(aus));
+        let pics: Vec<usize> = b.iter().flat_map(|&i| fields.colocated(i)).collect();
+        fields.prepare(pics, &|i| &aus[i]);
+        for &i in &b {
+            contexts[i] = fields.contexts(i, &|k| &aus[k]).ok();
+        }
+    }
+    let mut stats: Vec<Option<Result<MbStats>>> =
+        aus.par_iter().zip(&contexts).map(|(au, c)| frame_mb_stats(au, c.as_deref())).map(Some).collect();
     println!();
     println!("  {:>6} {:>4} {:>7} {:>7} {:>7} {:>9}", "frame", "type", "intra", "inter", "skip", "mean |mv|");
     for (i, (au, st)) in display.iter().map(|&d| (&aus[d], stats[d].take().expect("each frame once"))).enumerate() {
@@ -625,7 +644,10 @@ fn cmd_mosh(tools: &Tools, input: &Path, output: &Path, mut plan: MoshPlan, fx: 
     if fx.slices > 0 {
         println!("macroblock effects: {} slices", fx.slices);
         if fx.slices_without_motion > 0 {
-            println!("  motion effects skipped in {} I/B slices", fx.slices_without_motion);
+            println!(
+                "  motion effects skipped in {} slices without motion (I, or B whose references cannot be followed)",
+                fx.slices_without_motion
+            );
         }
         if fx.intra_killed > 0 {
             println!("  intra macroblocks replaced: {}", fx.intra_killed);

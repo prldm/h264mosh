@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod poc;
 pub mod pps;
 pub mod range;
+pub mod refs;
 mod renumber;
 pub mod residual;
 pub mod slice;

@@ -11,18 +11,20 @@
 //! compiled into a timeline.
 
 use crate::effects::{self, Donor, Donors, EffectStats, Fx, Mask, MbEffect, PpsNeeds};
-use crate::mb::MbContext;
+use crate::mb::{self, MbContext};
+use crate::motion::{self, BContext, BEdit, Fields};
 use crate::nal::{NAL_IDR, NAL_PPS, NAL_SPS, NalHeader, START_CODE};
 use crate::poc::PocDecoder;
 use crate::pps::Pps;
 use crate::range::{DupSpec, RangeSet};
+use crate::refs;
 use crate::renumber::{self, SpsNeeds, Targets};
 use crate::slice::{DecRefPicMarking, Mmco, SliceType};
 use crate::sps::Sps;
 use crate::stream::{AccessUnit, Nal, NalKind, Stream, group_access_units};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -230,24 +232,95 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
         upgrade_pps(&mut out, needs);
     }
     let donors = donors(src, timeline);
-    // frames are independent at the bitstream level: apply effects in parallel; seeds
-    // belong to the entries, so the result does not depend on scheduling
+    // the motion of a B-frame depends on the motion of the pictures it predicts from:
+    // B-frames with motion effects come after the others, in decoding order, and change
+    // the motion they have before any frame is edited
+    let b_slices = |f: &OutFrame, temporal: bool| {
+        f.au.slices().any(|s| s.header.slice_type() == SliceType::B && (!temporal || !s.header.direct_spatial_mv_pred_flag))
+    };
+    let motion_fx: Vec<bool> = out.iter().map(|f| timeline.entries[f.pos].effects.iter().any(|x| x.effect.needs_motion())).collect();
+    let after: Vec<bool> = out.iter().zip(&motion_fx).map(|(f, &m)| m && b_slices(f, false)).collect();
+    // and B-frames with temporal direct prediction from a picture whose motion changes
+    let temporal: Vec<bool> = out.iter().map(|f| b_slices(f, true)).collect();
+    let second = after.contains(&true) || (motion_fx.contains(&true) && temporal.contains(&true));
+    let unedited: Vec<AccessUnit> = if second { out.iter().map(|f| f.au.clone()).collect() } else { Vec::new() };
+    // the other frames are independent at the bitstream level: apply effects in
+    // parallel; seeds belong to the entries, so the result does not depend on scheduling
     let results: Vec<_> = out
         .par_iter()
         .enumerate()
-        .filter(|(_, f)| !timeline.entries[f.pos].effects.is_empty())
+        .filter(|(j, f)| !after[*j] && !timeline.entries[f.pos].effects.is_empty())
         .map(|(j, f)| {
             let e = &timeline.entries[f.pos];
-            (j, apply_frame_effects(&f.au, &e.effects, e.seed, &donors))
+            (j, apply_frame_effects(&f.au, &e.effects, e.seed, &donors, None))
         })
         .collect();
+    let mut changed = vec![false; out.len()];
     for (j, result) in results {
-        match result {
-            Ok((au, stats)) => {
-                out[j].au = au;
-                report.effects += stats;
+        changed[j] = keep_effects(&mut out, &mut report, j, result) && motion_fx[j];
+    }
+    if second {
+        let refs = refs::follow(unedited.iter());
+        let (mut before, mut now) = (Fields::new(refs.clone()), Fields::new(refs));
+        let mut reasons = HashSet::new();
+        let mut switched = 0;
+        // in waves: the frames whose colocated pictures are final, in parallel
+        let mut pending: Vec<usize> = (0..out.len()).filter(|&j| after[j] || temporal[j]).collect();
+        while !pending.is_empty() {
+            let waiting: HashSet<usize> = pending.iter().copied().collect();
+            let (ready, rest): (Vec<usize>, Vec<usize>) =
+                pending.iter().partition(|&&j| now.colocated(j).iter().all(|c| !waiting.contains(c)));
+            pending = rest;
+            // temporal direct prediction only needs a look where its pictures changed
+            let ready: Vec<usize> = ready.into_iter().filter(|&j| after[j] || now.colocated(j).iter().any(|&c| changed[c])).collect();
+            let cols: Vec<usize> = ready.iter().flat_map(|&j| now.colocated(j)).collect();
+            before.prepare(ready.iter().filter(|&&j| after[j]).flat_map(|&j| before.colocated(j)).collect::<Vec<_>>(), &|i| &unedited[i]);
+            now.prepare(cols, &|i| &out[i].au);
+            let jobs: Vec<_> = ready
+                .iter()
+                .map(|&j| {
+                    let edited = now.contexts(j, &|i| &out[i].au);
+                    let both = after[j].then(|| {
+                        let unedited = before.contexts(j, &|i| &unedited[i])?;
+                        let edited = edited.clone()?;
+                        Ok(unedited.into_iter().zip(edited).map(|(u, e)| Some(BEdit { unedited: u?, edited: e? })).collect::<Vec<_>>())
+                    });
+                    (j, edited, both)
+                })
+                .collect();
+            let results: Vec<_> = jobs
+                .into_par_iter()
+                .map(|(j, edited, both): (usize, Contexts<BContext>, Option<Contexts<BEdit>>)| match both {
+                    Some(contexts) => {
+                        let e = &timeline.entries[out[j].pos];
+                        let result = apply_frame_effects(&out[j].au, &e.effects, e.seed, &donors, contexts.as_deref().ok());
+                        (j, Some((result, contexts.err())), false)
+                    }
+                    None => (j, None, edited.is_ok_and(|c| temporal_direct_fails(&out[j].au, &c))),
+                })
+                .collect();
+            for (j, effects, switch) in results {
+                if let Some((result, missing)) = effects {
+                    if let Some(reason) = missing.filter(|r| reasons.insert(r.clone())) {
+                        report.warnings.push(format!("motion effects left out of B-frames: {reason}"));
+                    }
+                    changed[j] = keep_effects(&mut out, &mut report, j, result);
+                } else if switch {
+                    for n in out[j].au.nals.iter_mut() {
+                        if let Some(s) = n.slice_mut().filter(|s| s.header.slice_type() == SliceType::B) {
+                            s.header.direct_spatial_mv_pred_flag = true;
+                            n.dirty = true;
+                        }
+                    }
+                    (changed[j], switched) = (true, switched + 1);
+                }
+                now.forget(j);
             }
-            Err(reason) => report.failed_effects.push((out[j].pos, format!("frame {}: {reason}", out[j].src))),
+        }
+        if switched > 0 {
+            report.warnings.push(format!(
+                "{switched} B-frames switched to spatial direct prediction: the pictures their temporal direct prediction depends on now move otherwise"
+            ));
         }
     }
     report.failed_effects.sort_by_key(|(k, _)| *k);
@@ -316,15 +389,50 @@ pub fn segment(stream: &Stream, frames: &[RenderedFrame], range: Range<usize>) -
     Ok(out)
 }
 
+/// The frame with effects applied, or why not.
+type EffectResult = std::result::Result<(AccessUnit, EffectStats), String>;
+
+/// One context per slice of a frame, or why there are none.
+type Contexts<T> = std::result::Result<Vec<Option<T>>, String>;
+
+/// Keep the frame with effects applied, or report why not; whether they were.
+fn keep_effects(out: &mut [OutFrame], report: &mut RenderReport, j: usize, result: EffectResult) -> bool {
+    match result {
+        Ok((au, stats)) => {
+            out[j].au = au;
+            report.effects += stats;
+            true
+        }
+        Err(reason) => {
+            report.failed_effects.push((out[j].pos, format!("frame {}: {reason}", out[j].src)));
+            false
+        }
+    }
+}
+
+/// Whether temporal direct prediction in a B slice of `au` (with `contexts`, one per
+/// slice) needs a picture its list 0 does not have (8.4.1.2.3).
+fn temporal_direct_fails(au: &AccessUnit, contexts: &[Option<BContext>]) -> bool {
+    au.slices().zip(contexts).any(|(s, b)| {
+        let Some(b) = b.as_ref().filter(|_| !s.header.direct_spatial_mv_pred_flag) else { return false };
+        let Ok(ctx) = MbContext::new(s) else { return false };
+        mb::parse_slice_data(s).and_then(|data| motion::decode_motion(&ctx, &data, Some(b))).is_err()
+    })
+}
+
 /// Apply effects to every slice of a copy of the frame; all or nothing. Errors and
-/// panics are reported instead of aborting the render.
-fn apply_frame_effects(au: &AccessUnit, fx: &[Fx], seed: u64, donors: &Donors) -> std::result::Result<(AccessUnit, EffectStats), String> {
+/// panics are reported instead of aborting the render. `contexts` has one entry per
+/// slice, for the motion of B slices.
+fn apply_frame_effects(au: &AccessUnit, fx: &[Fx], seed: u64, donors: &Donors, contexts: Option<&[Option<BEdit>]>) -> EffectResult {
     let run = || -> Result<(AccessUnit, EffectStats)> {
         let mut au = au.clone();
         let mut stats = EffectStats::default();
+        let mut k = 0;
         for (i, n) in au.nals.iter_mut().enumerate() {
             if let NalKind::Slice(s) = &mut n.kind {
-                stats += effects::apply(s, fx, splitmix64(seed ^ i as u64), donors)?;
+                let b = contexts.and_then(|c| c.get(k)).and_then(Option::as_ref);
+                k += 1;
+                stats += effects::apply(s, fx, splitmix64(seed ^ i as u64), donors, b)?;
                 n.dirty = true;
             }
         }
@@ -351,11 +459,20 @@ fn donors(src: &Source, timeline: &Timeline) -> Donors {
             _ => None,
         })
         .collect();
+    // B-frames have their motion with the pictures they were coded against
+    let is_b = |i: &usize| src.aus.get(*i).is_some_and(|au| au.slices().any(|s| s.header.slice_type() == SliceType::B));
+    let mut contexts = HashMap::new();
+    if frames.iter().any(is_b) {
+        let mut fields = Fields::new(refs::follow(&src.aus));
+        for &i in frames.iter().filter(|i| is_b(i)) {
+            contexts.insert(i, fields.contexts(i, &|k| &src.aus[k]));
+        }
+    }
     frames
         .into_par_iter()
         .map(|i| {
             let donor = match src.aus.get(i) {
-                Some(au) => Donor::new(au).map_err(|e| format!("{e:#}")),
+                Some(au) => Donor::new(au, contexts.get(&i).and_then(|c| c.as_deref().ok())).map_err(|e| format!("{e:#}")),
                 None => Err(format!("the input has {} frames", src.len())),
             };
             (i, donor)

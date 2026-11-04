@@ -2,8 +2,8 @@
 //! that only rewrite the slice header (any stream).
 
 use crate::intra::{self, MbIntra};
-use crate::mb::{self, Blk, CoeffBlock, Macroblock, MbContext, MbType, SliceData};
-use crate::motion::{self, MbMotion, Mv};
+use crate::mb::{self, Blk, CoeffBlock, Macroblock, MbContext, MbType, Pred, Shape, SliceData};
+use crate::motion::{self, BContext, BEdit, MbMotion, Mv};
 use crate::pps::Pps;
 use crate::residual::Scaling;
 use crate::slice::{PredWeightTable, Slice, SliceType, WeightEntry};
@@ -25,13 +25,15 @@ pub enum MbEffect {
     /// Multiply the coded motion vector differences instead of the vectors: the error
     /// propagates through motion vector prediction across the picture.
     MvdScale(f32, f32),
-    /// Replace intra macroblocks of P slices by skipped ones, so moshed areas never refresh.
+    /// Replace intra macroblocks of P and B slices by skipped ones, so moshed areas never refresh.
     KillIntra,
     /// Drop all residual data: pictures are built from prediction only.
     ZeroResidual,
-    /// Code skipped macroblocks explicitly with identical motion (no visual change).
+    /// Code skipped macroblocks explicitly with identical motion (no visual change); in
+    /// B slices also the direct-predicted ones.
     ExplicitSkips,
-    /// Re-partition 16x16/16x8/8x16 macroblocks as P_8x8 with identical motion (no visual change).
+    /// Re-partition 16x16/16x8/8x16 macroblocks as P_8x8 or B_8x8 with identical motion
+    /// (no visual change); B_Direct_16x16 becomes B_8x8 of direct sub-macroblocks.
     SplitTo8x8,
     /// Set every intra prediction direction (numbered like Intra4x4PredMode: 0 vertical,
     /// 1 horizontal, 2 DC, 3..=8 diagonal); Intra16x16 and chroma take the nearest of
@@ -59,8 +61,9 @@ pub enum MbEffect {
     /// Copy macroblocks of another input frame (decode order) into the same places:
     /// (frame, fraction 0..=1 of the macroblocks, chosen at random).
     Transplant(usize, f32),
-    /// Give P-frame macroblocks the motion of another input frame (decode order) at the
-    /// same place, mixed with their own: (frame, 0..=1 how much of the other's).
+    /// Give macroblocks the motion of another input frame (decode order) at the same
+    /// place, mixed with their own (per list, where both use it): (frame, 0..=1 how
+    /// much of the other's).
     MotionTransplant(usize, f32),
     /// Deblocking filter offsets FilterOffsetA/B in steps of 2 (-6..=6): positive smooths more.
     Deblock(i32, i32),
@@ -72,8 +75,9 @@ pub enum MbEffect {
 }
 
 impl MbEffect {
-    /// Works on decoded motion (and only in P slices).
-    fn needs_motion(&self) -> bool {
+    /// Works on decoded motion: in P slices, and in B slices whose reference pictures
+    /// are known (see [`apply`]).
+    pub fn needs_motion(&self) -> bool {
         matches!(
             self,
             MbEffect::MvScale(..)
@@ -88,8 +92,9 @@ impl MbEffect {
         )
     }
 
-    /// Does nothing outside P slices.
-    fn p_only(&self) -> bool {
+    /// Does nothing in slices without known motion (I slices; B slices whose reference
+    /// pictures are not known).
+    fn motion_only(&self) -> bool {
         self.needs_motion() && !matches!(self, MbEffect::Transplant(..))
     }
 
@@ -259,7 +264,9 @@ fn scale(v: i32, s: f32) -> i32 {
 #[derive(Clone)]
 struct DonorMb {
     mb: Macroblock,
-    /// decoded motion, for macroblocks of P slices
+    /// the type of its slice
+    slice_type: SliceType,
+    /// decoded motion, for macroblocks of P slices, and of B slices with known references
     motion: Option<MbMotion>,
     intra: Option<MbIntra>,
 }
@@ -273,27 +280,34 @@ pub struct Donor {
 }
 
 impl Donor {
-    pub fn new(au: &AccessUnit) -> Result<Self> {
+    /// The macroblocks of `au`; `contexts` (one per slice, see
+    /// [`motion::Fields::contexts`]) gives the motion of its B slices.
+    pub fn new(au: &AccessUnit, contexts: Option<&[Option<BContext>]>) -> Result<Self> {
         let Some(first) = au.first_slice() else { bail!("the frame has no slices") };
         let (sps, pps) = (first.sps.clone(), first.pps.clone());
         let mut mbs = Vec::new();
-        for s in au.slices() {
+        for (k, s) in au.slices().enumerate() {
             let ctx = MbContext::new(s)?;
             if *s.sps != *sps || *s.pps != *pps {
                 bail!("the frame's slices use different parameter sets");
             }
             let data = mb::parse_slice_data(s)?;
-            let motion = if ctx.slice_type == SliceType::P { Some(motion::decode_motion(&ctx, &data)?) } else { None };
+            let b = contexts.and_then(|c| c.get(k)).and_then(Option::as_ref);
+            let motion = match ctx.slice_type {
+                SliceType::P => Some(motion::decode_motion(&ctx, &data, None)?),
+                SliceType::B if b.is_some() => Some(motion::decode_motion(&ctx, &data, b)?),
+                _ => None,
+            };
             let intra = intra::decode_intra(&ctx, &data);
             mbs.resize(mbs.len().max(ctx.pic_size), None);
             for (i, mb) in data.mbs.into_iter().enumerate() {
                 let inter = !mb.mb_type.is_intra();
                 if inter && motion.is_none() {
-                    // B macroblocks cannot be copied
+                    // inter macroblocks are copied with their motion
                     continue;
                 }
                 let motion = motion.as_ref().map(|m| m[i]);
-                mbs[data.first_mb + i] = Some(DonorMb { mb, motion, intra: intra[i] });
+                mbs[data.first_mb + i] = Some(DonorMb { mb, slice_type: ctx.slice_type, motion, intra: intra[i] });
             }
         }
         Ok(Self { sps, pps, mbs })
@@ -311,7 +325,9 @@ pub type Donors = HashMap<usize, std::result::Result<Donor, String>>;
 
 /// Apply `effects` in order to one slice and replace its slice data. Macroblock
 /// effects need the macroblock layer; slice-level effects rewrite the header only.
-pub fn apply(slice: &mut Slice, effects: &[Fx], seed: u64, donors: &Donors) -> Result<EffectStats> {
+/// Motion effects in a B slice need its contexts `b` (reference pictures and the motion
+/// of the colocated picture, see [`motion::Fields`]); without them they leave it alone.
+pub fn apply(slice: &mut Slice, effects: &[Fx], seed: u64, donors: &Donors, b: Option<&BEdit>) -> Result<EffectStats> {
     let mut stats = EffectStats { slices: 1, ..Default::default() };
     if effects.is_empty() {
         return Ok(stats);
@@ -326,7 +342,7 @@ pub fn apply(slice: &mut Slice, effects: &[Fx], seed: u64, donors: &Donors) -> R
         let ctx = MbContext::new(slice)?;
         let mut data = mb::parse_slice_data(slice)?;
         let mut slice_qp = ctx.slice_qp();
-        apply_to_data(&ctx, &mut data, &mut slice_qp, effects, seed, donors, &mut stats)?;
+        stats += apply_to_data(&ctx, &mut data, &mut slice_qp, effects, seed, donors, b)?;
         (data, slice_qp)
     };
     slice.header.slice_qp_delta = slice_qp - 26 - slice.pps.pic_init_qp_minus26;
@@ -396,18 +412,24 @@ fn apply_to_data(
     effects: &[Fx],
     seed: u64,
     donors: &Donors,
-    stats: &mut EffectStats,
-) -> Result<()> {
+    b: Option<&BEdit>,
+) -> Result<EffectStats> {
+    let mut stats = EffectStats::default();
     let is_p = ctx.slice_type == SliceType::P;
+    // the motion of a B slice depends on its reference pictures
+    let has_motion = is_p || (ctx.slice_type == SliceType::B && b.is_some());
     let height = ctx.pic_size / ctx.width;
     let first = data.first_mb;
     let inside = |fx: &Fx, i: usize| fx.mask.as_ref().is_none_or(|m| m.contains(first + i, ctx.width, height));
     let motion = effects.iter().any(|f| f.effect.needs_motion());
-    if !is_p && effects.iter().any(|f| f.effect.p_only()) {
+    if !has_motion && effects.iter().any(|f| f.effect.motion_only()) {
         stats.slices_without_motion = 1;
     }
-    let mut target: Vec<Option<MbMotion>> =
-        if motion && is_p { motion::decode_motion(ctx, data)?.into_iter().map(Some).collect() } else { Vec::new() };
+    let mut target: Vec<Option<MbMotion>> = if motion && has_motion {
+        motion::decode_motion(ctx, data, b.map(|b| &b.unedited))?.into_iter().map(Some).collect()
+    } else {
+        Vec::new()
+    };
     // killing only some intra macroblocks changes how the others are predicted
     let intra = effects.iter().any(|f| f.effect.needs_intra() || (f.effect == MbEffect::KillIntra && f.mask.is_some()));
     let mut intra_target = if intra { intra::decode_intra(ctx, data) } else { Vec::new() };
@@ -419,7 +441,7 @@ fn apply_to_data(
     let map = |target: &mut Vec<Option<MbMotion>>, fx: &Fx, f: &dyn Fn(Mv) -> Mv| {
         for (_, t) in target.iter_mut().enumerate().filter(|(i, _)| inside(fx, *i)) {
             if let Some(t) = t.as_mut().filter(|t| !t.is_intra()) {
-                t.mv.iter_mut().for_each(|mv| *mv = clamp_mv(f(*mv), limits));
+                t.map_mvs(|mv| clamp_mv(f(mv), limits));
             }
         }
     };
@@ -486,7 +508,7 @@ fn apply_to_data(
                     }
                 }
             }
-            _ if !is_p && fx.effect.p_only() => {}
+            _ if !has_motion && fx.effect.motion_only() => {}
             MbEffect::KillIntra => {
                 for (i, (mb, t)) in data.mbs.iter_mut().zip(target.iter_mut()).enumerate() {
                     if mb.mb_type.is_intra() && inside(fx, i) {
@@ -499,9 +521,16 @@ fn apply_to_data(
                     }
                 }
             }
-            MbEffect::ExplicitSkips => {
+            MbEffect::ExplicitSkips if is_p => {
                 for (_, mb) in data.mbs.iter_mut().enumerate().filter(|(i, m)| m.mb_type == MbType::Skip && inside(fx, *i)) {
                     *mb = Macroblock::new(MbType::P(0), mb.qp);
+                }
+            }
+            MbEffect::ExplicitSkips => {
+                for (i, (mb, t)) in data.mbs.iter_mut().zip(&target).enumerate() {
+                    if let Some(t) = t.as_ref().filter(|_| motion::has_direct(mb) && inside(fx, i)) {
+                        motion::code_explicitly(ctx, mb, t)?;
+                    }
                 }
             }
             MbEffect::SplitTo8x8 => data.mbs.iter_mut().enumerate().filter(|(i, _)| inside(fx, *i)).for_each(|(_, mb)| split_to_8x8(mb)),
@@ -513,7 +542,18 @@ fn apply_to_data(
                     let Some(t) = t.as_mut().filter(|t| !t.is_intra()) else { continue };
                     let d = [rng.range(n), rng.range(n)];
                     if inside(fx, i) {
-                        t.mv.iter_mut().for_each(|mv| *mv = clamp_mv([mv[0].saturating_add(d[0]), mv[1].saturating_add(d[1])], limits));
+                        t.map_mvs(|mv| clamp_mv([mv[0].saturating_add(d[0]), mv[1].saturating_add(d[1])], limits));
+                    }
+                }
+            }
+            MbEffect::RefShift(n) if !is_p => {
+                // B slices: both lists, through the motion target
+                let max = [ctx.num_ref_minus1(0) as i32, ctx.num_ref_minus1(1) as i32];
+                for (_, t) in target.iter_mut().enumerate().filter(|(i, _)| inside(fx, *i)) {
+                    if let Some(t) = t {
+                        for (refs, max) in t.ref_idx.iter_mut().zip(max) {
+                            refs.iter_mut().filter(|r| **r >= 0).for_each(|r| *r = (*r as i32 + n).clamp(0, max) as i8);
+                        }
                     }
                 }
             }
@@ -545,40 +585,64 @@ fn apply_to_data(
                     let own = t.as_mut().filter(|t| !t.is_intra());
                     let other = donor.mbs.get(first + i).and_then(|d| d.as_ref()?.motion).filter(|m| !m.is_intra());
                     if let (Some(t), Some(m)) = (own, other) {
-                        for (mv, d) in t.mv.iter_mut().zip(m.mv) {
-                            *mv = clamp_mv([blend(mv[0], d[0]), blend(mv[1], d[1])], limits);
+                        for l in 0..2 {
+                            for b in 0..16 {
+                                if t.ref_idx[l][b] >= 0 && m.ref_idx[l][b] >= 0 {
+                                    let (mv, d) = (t.mv(l, b), m.mv(l, b));
+                                    t.set_mv(l, b, clamp_mv([blend(mv[0], d[0]), blend(mv[1], d[1])], limits));
+                                }
+                            }
                         }
                     }
                 }
             }
             MbEffect::Transplant(from, amount) => {
-                if ctx.slice_type == SliceType::B {
+                if ctx.slice_type == SliceType::B && !has_motion {
+                    // the other macroblocks' motion would change with their neighbours
                     continue;
                 }
                 let donor = donor(donors, from, ctx)?;
-                let max_ref = ctx.header.num_ref_idx_l0_active_minus1 as u8;
+                let max_ref = [ctx.num_ref_minus1(0) as u8, ctx.num_ref_minus1(1) as u8];
                 for i in 0..data.mbs.len() {
                     // draw for every macroblock, so the choice does not depend on the mask
                     if !own_rng.chance(amount) || !inside(fx, i) {
                         continue;
                     }
                     let Some(dm) = donor.mbs.get(first + i).and_then(Option::as_ref) else { continue };
-                    if !dm.mb.mb_type.is_intra() && !is_p {
+                    let inter = !dm.mb.mb_type.is_intra();
+                    // B macroblocks do not fit into P slices
+                    if inter && (!has_motion || (is_p && dm.slice_type == SliceType::B)) {
                         continue;
                     }
                     let mut mb = dm.mb.clone();
-                    mb.ref_idx[0].iter_mut().for_each(|r| *r = (*r).min(max_ref));
-                    data.mbs[i] = mb;
                     if is_p {
+                        mb.ref_idx[0].iter_mut().for_each(|r| *r = (*r).min(max_ref[0]));
                         target[i] = Some(dm.motion.unwrap_or(MbMotion::INTRA));
+                    } else if let (true, Some(mut motion)) = (inter, dm.motion) {
+                        // into a B slice: the motion with reference indices it has, coded in
+                        // B partitions (P macroblocks predict from list 0)
+                        for (refs, max) in motion.ref_idx.iter_mut().zip(max_ref) {
+                            refs.iter_mut().filter(|r| **r >= 0).for_each(|r| *r = (*r).min(max as i8));
+                        }
+                        if dm.slice_type == SliceType::P {
+                            if mb.mb_type == MbType::Skip {
+                                mb.cbp = 0;
+                            }
+                            mb.mb_type = MbType::B(1);
+                            motion::code_explicitly(ctx, &mut mb, &motion)?;
+                        }
+                        target[i] = Some(motion);
+                    } else if !is_p && has_motion {
+                        target[i] = Some(MbMotion::INTRA);
                     }
+                    data.mbs[i] = mb;
                     intra_target[i] = dm.intra;
                 }
             }
         }
     }
-    if motion && is_p {
-        motion::encode_motion(ctx, data, &target)?;
+    if motion && has_motion {
+        motion::encode_motion(ctx, data, &target, b.map(|b| &b.edited))?;
     }
     for fx in effects {
         if let MbEffect::MvdScale(sx, sy) = fx.effect {
@@ -598,7 +662,7 @@ fn apply_to_data(
     if untouched.iter().any(|&u| u) {
         keep_quantizers(ctx, data, *slice_qp, &qps, &untouched)?;
     }
-    Ok(())
+    Ok(stats)
 }
 
 /// Uncoded macroblocks take the QP of the macroblock before them. Where effects inside
@@ -617,15 +681,17 @@ fn keep_quantizers(ctx: &MbContext, data: &mut SliceData, slice_qp: i32, qps: &[
             pred = mb.qp;
             continue;
         }
-        if !untouched[i] || pred == qps[i] || !matches!(mb.mb_type, MbType::INxN | MbType::P(_) | MbType::Skip) {
+        if !untouched[i] || pred == qps[i] || !matches!(mb.mb_type, MbType::INxN | MbType::P(_) | MbType::B(_) | MbType::Skip) {
             mb.qp = pred;
             continue;
         }
         if mb.mb_type == MbType::Skip {
-            if ctx.slice_type != SliceType::P {
-                continue;
+            match ctx.slice_type {
+                SliceType::P => skips.push(i),
+                // B_Skip and B_Direct_16x16 have the same motion
+                SliceType::B => *mb = Macroblock::new(MbType::B(0), mb.qp),
+                _ => continue,
             }
-            skips.push(i);
         }
         mb.cbp = 1;
         (mb.cbp, mb.transform_8x8) = mb::without_empty_8x8(ctx, mb);
@@ -634,13 +700,13 @@ fn keep_quantizers(ctx: &MbContext, data: &mut SliceData, slice_qp: i32, qps: &[
     }
     if !skips.is_empty() {
         // coded skips: P_L0_16x16 with the motion the skip had
-        let motion = motion::decode_motion(ctx, data)?;
+        let motion = motion::decode_motion(ctx, data, None)?;
         for &i in &skips {
             let qp = data.mbs[i].qp;
             data.mbs[i] = Macroblock::new(MbType::P(0), qp);
             data.mbs[i].cbp = 1;
         }
-        motion::encode_motion(ctx, data, &motion.into_iter().map(Some).collect::<Vec<_>>())?;
+        motion::encode_motion(ctx, data, &motion.into_iter().map(Some).collect::<Vec<_>>(), None)?;
     }
     Ok(())
 }
@@ -793,6 +859,34 @@ fn split_to_8x8(mb: &mut Macroblock) {
         MbType::P(0) => [refs[0]; 4],
         MbType::P(1) => [refs[0], refs[0], refs[1], refs[1]],
         MbType::P(2) => [refs[0], refs[1], refs[0], refs[1]],
+        MbType::B(0) => {
+            mb.mb_type = MbType::B(22);
+            mb.sub_types = [0; 4];
+            return;
+        }
+        MbType::B(1..=21) => {
+            // each 8x8 block takes the prediction mode and references of its partition
+            let parts = motion::partitions(mb);
+            let part = |q: usize| match mb.mb_type.shape() {
+                Shape::S16x8 => &parts[q / 2],
+                Shape::S8x16 => &parts[q % 2],
+                _ => &parts[0],
+            };
+            let mut ref_idx = [[0; 4]; 2];
+            let mut subs = [0; 4];
+            for q in 0..4 {
+                let p = part(q);
+                subs[q] = match p.pred {
+                    Pred::L0 => 1,
+                    Pred::L1 => 2,
+                    _ => 3,
+                };
+                ref_idx[0][q] = p.ref_idx[0];
+                ref_idx[1][q] = p.ref_idx[1];
+            }
+            (mb.mb_type, mb.sub_types, mb.ref_idx) = (MbType::B(22), subs, ref_idx);
+            return;
+        }
         _ => return,
     };
     mb.mb_type = MbType::P(3);
