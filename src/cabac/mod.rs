@@ -10,7 +10,7 @@
 //! An 8x8 transform block has 64 coefficients in CABAC; the model keeps it as the four
 //! interleaved 4x4 blocks of CAVLC (7.3.5.3.1: coefficient 4 * i + j of the 8x8 block is
 //! coefficient i of 4x4 block j). Its coded_block_flag is not coded outside 4:4:4, so
-//! the writer drops 8x8 blocks without coefficients from the coded block pattern.
+//! the writer recodes 8x8 blocks without coefficients in a way that decodes the same.
 
 pub mod binarize;
 pub mod engine;
@@ -391,10 +391,20 @@ impl<'a, E: Engine> Coder<'a, E> {
                 && m.transform_8x8
                 && (mb_type == MbType::INxN || t8_allowed)
             {
-                // an 8x8 block without coefficients cannot be coded under its CodedBlockPatternLuma bit
-                for b8 in 0..4 {
-                    if (0..4).all(|j| levels_of(&src.coeffs, Blk::Luma(0, 4 * b8 + j)).iter().all(|&l| l == 0)) {
-                        m.cbp &= !(1 << b8);
+                // An 8x8 block without coefficients cannot be coded under its
+                // CodedBlockPatternLuma bit. Keep the picture and the QP: without any luma
+                // coefficients an inter macroblock can take the 4x4 transform instead;
+                // otherwise the empty blocks go, and an empty chroma DC keeps mb_qp_delta.
+                let empty = (0..4)
+                    .filter(|&b8| (0..4).all(|j| levels_of(&src.coeffs, Blk::Luma(0, 4 * b8 + j)).iter().all(|&l| l == 0)))
+                    .fold(0, |e, b8| e | 1 << b8)
+                    & m.cbp;
+                if empty != 0 && mb_type != MbType::INxN && empty == m.cbp & 15 {
+                    m.transform_8x8 = false;
+                } else if empty != 0 {
+                    m.cbp &= !empty;
+                    if m.cbp == 0 && ctx.chroma_array_type != 0 {
+                        m.cbp = 0x10;
                     }
                 }
             }
