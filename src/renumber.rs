@@ -9,7 +9,7 @@
 //! while the decoder still holds them; otherwise they are repaired so that every
 //! reference index has a picture and the decoder never holds too many.
 
-use crate::mosh::{Source, Timeline};
+use crate::mosh::{Source, Timeline, TimelineEntry};
 use crate::slice::{DecRefPicMarking, Mmco, RplmOp, SliceHeader, SliceType};
 use crate::sps::{BitstreamRestriction, Sps, Vui};
 use crate::stream::AccessUnit;
@@ -24,7 +24,13 @@ pub(crate) struct Targets {
     lists: Vec<[Vec<Option<usize>>; 2]>,
     /// one entry per memory_management_control_operation
     marking: Vec<Option<usize>>,
+    /// per slice: the pictures its reference lists hold (temporal direct depends on them)
+    held: Vec<Lists>,
 }
+
+/// Reference lists 0 and 1 as frames (input frames or timeline entries), None where an
+/// index has no picture.
+type Lists = [Vec<Option<usize>>; 2];
 
 /// A short-term reference frame held by the decoder.
 #[derive(Clone, Copy, Debug)]
@@ -114,6 +120,11 @@ pub(crate) fn source_targets(aus: &[AccessUnit], pocs: &[Option<i64>]) -> Vec<Ta
                     .collect()
             };
             let lists = au.slices().map(|s| [resolve(&s.header.rplm_l0), resolve(&s.header.rplm_l1)]).collect();
+            let poc = pocs[i].unwrap_or(0);
+            let held = au
+                .slices()
+                .map(|s| slice_lists(&dpb, &s.header, poc, h.frame_num, max).map(|l| l.iter().map(|f| f.map(|r| r.src)).collect()))
+                .collect();
             let marking = match &h.dec_ref_pic_marking {
                 Some(DecRefPicMarking::NonIdr(Some(ops))) => ops
                     .iter()
@@ -125,10 +136,10 @@ pub(crate) fn source_targets(aus: &[AccessUnit], pocs: &[Option<i64>]) -> Vec<Ta
                 _ => Vec::new(),
             };
             if au.is_reference() {
-                let cur = Ref { frame_num: h.frame_num, poc: pocs[i].unwrap_or(0), src: i, pos: i };
+                let cur = Ref { frame_num: h.frame_num, poc, src: i, pos: i };
                 dpb.mark(cur, au.is_idr(), h.dec_ref_pic_marking.as_ref(), sps.max_num_ref_frames.max(1) as usize, max);
             }
-            Targets { lists, marking }
+            Targets { lists, marking, held }
         })
         .collect()
 }
@@ -303,6 +314,8 @@ pub(crate) fn plan(src: &Source, timeline: &Timeline, order: &[usize]) -> Result
     let mut decoded = vec![false; entries.len()];
     let mut waiting = BTreeSet::new();
     let mut next_shown = 0;
+    // the lists of each slice of the frames decoded so far, as timeline entries
+    let mut lists_of: Vec<Vec<Lists>> = vec![Vec::new(); entries.len()];
     for &k in order {
         let e = &entries[k];
         let au = &src.aus[e.src];
@@ -363,6 +376,12 @@ pub(crate) fn plan(src: &Source, timeline: &Timeline, order: &[usize]) -> Result
                         h.rplm_l0 = fix_list(&l0, h.rplm_l0.take(), t0, &dpb, frame_num, active0, max_fn);
                     }
                 }
+                let lists = slice_lists(&dpb, &h, poc, frame_num, max_fn).map(|l| l.iter().map(|f| f.map(|r| r.pos)).collect());
+                if st == SliceType::B && !h.direct_spatial_mv_pred_flag && !temporal_direct_holds(src, entries, &lists, i, e.src, &lists_of)
+                {
+                    h.direct_spatial_mv_pred_flag = true;
+                }
+                lists_of[k].push(lists);
                 frame.push(h);
             }
             headers.push(frame);
@@ -407,6 +426,35 @@ pub(crate) fn plan(src: &Source, timeline: &Timeline, order: &[usize]) -> Result
         }
     }
     Ok(Plan { headers, needs })
+}
+
+/// Temporal direct prediction (8.4.1.2.3) takes the motion of the first picture of
+/// list 1 and the pictures that one predicts from, which have to be in list 0. That
+/// holds as encoded when slice `slice` of input frame `frame` (now with `lists`) and
+/// that picture hold the same frames as in the input; otherwise spatial direct
+/// prediction stands in, which needs nothing but the lists.
+fn temporal_direct_holds(src: &Source, entries: &[TimelineEntry], lists: &Lists, slice: usize, frame: usize, held: &[Vec<Lists>]) -> bool {
+    let as_input = |l: &Lists| l.clone().map(|v| v.iter().map(|p| p.map(|p| entries[p].src)).collect::<Vec<_>>());
+    let same = |out: &[Lists], input: &[Lists]| out.len() == input.len() && out.iter().zip(input).all(|(o, i)| as_input(o) == *i);
+    let Some(col) = lists[1].first().copied().flatten() else { return false };
+    src.refs[frame].held.get(slice).is_some_and(|orig| as_input(lists) == *orig) && same(&held[col], &src.refs[entries[col].src].held)
+}
+
+/// The reference lists of a slice of frame `frame_num` (picture order count `poc`)
+/// whose decoder holds `dpb`: list 1 only for B slices, empty for intra slices or
+/// lists with long-term pictures.
+fn slice_lists<'a>(dpb: &'a Dpb, h: &SliceHeader, poc: i64, frame_num: u32, max_frame_num: u32) -> [Vec<Option<&'a Ref>>; 2] {
+    let st = h.slice_type();
+    if st.is_intra() || dpb.refs.is_empty() {
+        return [Vec::new(), Vec::new()];
+    }
+    let (l0, l1) = if st == SliceType::B { b_lists(dpb, poc) } else { (dpb.refs.iter().rev().map(|r| r.frame_num).collect(), Vec::new()) };
+    let list = |initial: &[u32], ops: &Option<Vec<RplmOp>>, active: u32| {
+        let frames = modified_list(initial, ops.as_deref(), frame_num, active as usize + 1, max_frame_num).unwrap_or_default();
+        frames.into_iter().map(|f| f.and_then(|f| dpb.find(f))).collect()
+    };
+    let l1 = if st == SliceType::B { list(&l1, &h.rplm_l1, h.num_ref_idx_l1_active_minus1) } else { Vec::new() };
+    [list(&l0, &h.rplm_l0, h.num_ref_idx_l0_active_minus1), l1]
 }
 
 /// Initial reference lists of a B frame with picture order count `poc` (8.2.4.2.3), as
@@ -505,18 +553,28 @@ fn encode_list(ops: &[RplmOp], pics: &[u32], frame_num: u32, max_frame_num: u32)
 /// `ops` (8.2.4.3.1) has a picture for each of its `active` entries. Lists with
 /// long-term pictures are not checked.
 fn list_complete(initial: &[u32], ops: Option<&[RplmOp]>, frame_num: u32, active: usize, max_frame_num: u32) -> bool {
+    if ops.unwrap_or_default().iter().any(|&(idc, _)| idc > 1) {
+        return true;
+    }
+    modified_list(initial, ops, frame_num, active, max_frame_num).is_some_and(|l| l.iter().all(Option::is_some))
+}
+
+/// The list starting as `initial` (frame_num values) modified by `ops`, `active`
+/// entries long, None where an entry has no picture; None if a modification refers to
+/// no picture of `initial` or to a long-term picture.
+fn modified_list(initial: &[u32], ops: Option<&[RplmOp]>, frame_num: u32, active: usize, max_frame_num: u32) -> Option<Vec<Option<u32>>> {
     let mut list: Vec<Option<u32>> = initial.iter().map(|&f| Some(f)).take(active).collect();
     list.resize(active, None);
     let mut pred = frame_num;
     for (i, &(idc, v)) in ops.unwrap_or_default().iter().enumerate() {
         let pic = match idc {
-            _ if v >= max_frame_num => return false,
+            _ if v >= max_frame_num => return None,
             0 => (pred + max_frame_num - (v + 1)) % max_frame_num,
             1 => (pred + v + 1) % max_frame_num,
-            _ => return true,
+            _ => return None,
         };
         if !initial.contains(&pic) || i >= active {
-            return false;
+            return None;
         }
         pred = pic;
         // insert at index i, drop the later copies of the same picture
@@ -525,7 +583,7 @@ fn list_complete(initial: &[u32], ops: Option<&[RplmOp]>, frame_num: u32, active
         list.extend(rest);
         list.resize(active, None);
     }
-    list.iter().all(Option::is_some)
+    Some(list)
 }
 
 /// ref_pic_list_modification for a list that uses `active` indices but starts as only

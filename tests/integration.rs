@@ -216,6 +216,14 @@ fn mosh_edits_bframes_and_keeps_first_frame() {
     let (md5, err) = decode(&out.write(false).unwrap(), "bframe_drop.264");
     assert!(err.is_empty(), "{err}");
     assert_eq!(md5.len(), 24);
+    // frame numbers are display positions: frame 5 three more times, frame 3 gone
+    let src = Source::new(Stream::parse(&data).unwrap());
+    assert_ne!(src.display, (0..src.len()).collect::<Vec<_>>());
+    let plan = MoshPlan { drop: Some("3".parse().unwrap()), dup: vec!["5:3".parse().unwrap()], ..Default::default() };
+    let (_, rep) = mosh(Stream::parse(&data).unwrap(), &plan).unwrap();
+    let shown: Vec<usize> = rep.render.frames.iter().map(|f| f.src).collect();
+    let want: Vec<usize> = [0, 1, 2, 4, 5, 5, 5, 5].into_iter().chain(6..25).map(|k| src.display[k]).collect();
+    assert_eq!(shown, want);
 
     let data = mosh_friendly("testsrc2", 1, &[]);
     let plan = MoshPlan { drop: Some("0-1".parse().unwrap()), ..Default::default() };
@@ -1075,4 +1083,30 @@ fn remux_keeps_bframe_pictures() {
             assert!(md5 == raw, "{name} {case}: remuxed pictures differ ({} vs {})", md5.len(), raw.len());
         }
     }
+}
+
+/// A B-frame with temporal direct prediction takes motion from the first picture of
+/// list 1 and needs that picture's references; moved elsewhere it switches to spatial
+/// direct prediction, while B-frames left in place keep temporal.
+#[test]
+fn moved_bframes_leave_temporal_direct() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let (name, data) = bframe_configs().swap_remove(4);
+    assert_eq!(name, "b_temporal_cavlc");
+    let src = Source::new(Stream::parse(&data).unwrap());
+    let n = src.len();
+    // x264 codes some B-frames with spatial direct prediction anyway
+    let temporal = |au: &h264mosh::stream::AccessUnit| {
+        au.slices().any(|s| s.header.slice_type() == SliceType::B && !s.header.direct_spatial_mv_pred_flag)
+    };
+    let b = (1..n).find(|&p| temporal(&src.aus[src.display[p]])).unwrap();
+    let timeline = shown(&src, (0..b).chain(b + 1..b + 12).chain([b]).chain(b + 12..n));
+    let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+    let au = |k: usize| h264mosh::stream::AccessUnit { nals: out.nals[rep.frames[k].nals.clone()].to_vec() };
+    assert!(!temporal(&au(b + 11)), "the moved B-frame");
+    let last = (0..n).rev().find(|&p| temporal(&src.aus[src.display[p]])).unwrap();
+    assert!(temporal(&au(last)), "a B-frame far from the edit");
+    render_checked(&src, &timeline, "temporal_moved");
 }
