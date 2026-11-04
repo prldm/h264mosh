@@ -1463,6 +1463,17 @@ mod tests {
         assert_eq!(out.len(), srcs.len());
         assert_eq!(out.frame_of(b.id), Some(19));
         assert_eq!(out.report.frames[19].src, b.src);
+
+        // motion effects change the B-frames too
+        let all = project(&h).cards.cards.iter().map(|c| c.id).collect();
+        h.state_mut().timeline.selection = all;
+        let ctx = h.ctx.clone();
+        h.state_mut().panel_action(&ctx, Action::Add(MbEffect::MvScale(2.0, -1.0)));
+        render(&mut h);
+        assert!(h.state().notice.is_none(), "{}", h.state().notice.as_ref().unwrap().text);
+        let out = rendered(&h);
+        assert!(out.report.failed_effects.is_empty() && out.report.warnings.is_empty(), "{:?}", out.report);
+        assert_eq!(out.report.effects.slices_without_motion, 1, "only the I-frame has no motion");
     }
 
     /// By default clips are encoded to CAVLC (raw CAVLC streams are used as they are);

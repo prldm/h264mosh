@@ -66,9 +66,9 @@ pub struct Effect {
     pub mask: Option<Mask>,
 }
 
-/// Does `effect` change a frame of this type? Motion effects, kill-intra, reference
-/// shifts and weighted prediction work on P-frames only; residual, quantizer, intra and
-/// deblocking effects on any frame.
+/// Does `effect` change a frame of this type? Motion effects, kill-intra and reference
+/// shifts work on P- and B-frames, weighted prediction on P-frames only; residual,
+/// quantizer, intra, transplant and deblocking effects on any frame.
 pub fn affects(effect: &MbEffect, frame_kind: char) -> bool {
     match effect {
         MbEffect::ZeroResidual
@@ -80,10 +80,10 @@ pub fn affects(effect: &MbEffect, frame_kind: char) -> bool {
         | MbEffect::IntraRotate(_)
         | MbEffect::IntraRandom(_)
         | MbEffect::IntraCascade(_)
+        | MbEffect::Transplant(..)
         | MbEffect::Deblock(..) => true,
-        MbEffect::MvdScale(..) => frame_kind != 'I',
-        MbEffect::Transplant(..) => frame_kind != 'B',
-        _ => frame_kind == 'P',
+        MbEffect::Weight(..) | MbEffect::Tint(..) => frame_kind == 'P',
+        _ => frame_kind != 'I',
     }
 }
 
@@ -595,6 +595,10 @@ mod tests {
     fn effects_skip_frame_types_they_cannot_change() {
         assert!(!affects(&MbEffect::MvScale(2.0, 2.0), 'I'));
         assert!(affects(&MbEffect::MvScale(2.0, 2.0), 'P'));
+        assert!(affects(&MbEffect::MvScale(2.0, 2.0), 'B'));
+        assert!(affects(&MbEffect::KillIntra, 'B'));
+        assert!(!affects(&MbEffect::Weight(1.1, 0), 'B'));
+        assert!(affects(&MbEffect::Transplant(3, 1.0), 'B'));
         assert!(!affects(&MbEffect::KillIntra, 'I'));
         assert!(affects(&MbEffect::ZeroResidual, 'I'));
         assert!(affects(&MbEffect::MvdScale(2.0, 2.0), 'P'));

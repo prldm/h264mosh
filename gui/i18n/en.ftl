@@ -32,7 +32,7 @@ import-bframes =
         [one] 1 B-frame
        *[other] { $count } B-frames
     }
-import-bframes-tooltip = Clips opened from now on get B-frames, which predict from the frames before and after them. Moved to other places they take their motion from new neighbours. Most effects change P-frames only.
+import-bframes-tooltip = Clips opened from now on get B-frames, which predict from the frames before and after them. Moved to other places they take their motion from new neighbours. Effects change them too, except the brightness and colour drifts.
 import-bframes-pyramid =
     { $count ->
         [one] 1 B-frame, also as reference
@@ -160,22 +160,22 @@ effect-remove = Remove from selection
 effect-remove-tooltip = Take this effect away from the selected frames.
 effect-delete = Delete effect
 effect-mv-scale = Motion scale
-effect-mv-scale-about = Multiplies the motion vectors: movement gets stronger, reversed or frozen. P-frames only.
+effect-mv-scale-about = Multiplies the motion vectors: movement gets stronger, reversed or frozen. P- and B-frames.
 effect-mv-shift = Motion shift
-effect-mv-shift-about = Adds an offset to every motion vector, so everything slides. P-frames only.
+effect-mv-shift-about = Adds an offset to every motion vector, so everything slides. P- and B-frames.
 effect-mv-jitter = Motion jitter
-effect-mv-jitter-about = A random offset for each macroblock. P-frames only.
+effect-mv-jitter-about = A random offset for each macroblock. P- and B-frames.
 effect-mvd-scale = Vector error
 effect-mvd-scale-about = Multiplies the coded vector differences; the error spreads through the prediction, more chaotic than motion scale.
 effect-kill-intra = Freeze
-effect-kill-intra-about = Intra macroblocks of P-frames are skipped, so moshed areas never heal.
+effect-kill-intra-about = Intra macroblocks of P- and B-frames are skipped, so moshed areas never heal.
 effect-zero-residual = Ghost
 effect-zero-residual-about = Drops all residual data: pictures come from prediction only, no new detail comes in.
 effect-ref-shift = Echo
-effect-ref-shift-about = Blocks of P-frames predict from older frames, so moving parts leave echoes. Needs clips opened with several reference frames.
+effect-ref-shift-about = Blocks of P- and B-frames predict from other reference frames (P-frames from older ones), so moving parts leave echoes. Needs clips opened with several reference frames.
 effect-ref-shift-one-ref = This stream has one reference frame, so nothing changes. Open the clips again after choosing more reference frames under File ▸ New clips.
 effect-motion-transplant = Borrowed motion
-effect-motion-transplant-about = P-frames move the way another frame moved: its motion vectors, at the same places, replace or mix with their own.
+effect-motion-transplant-about = P- and B-frames move the way another frame moved: its motion vectors, at the same places, replace or mix with their own.
 effect-transplant = Transplant
 effect-transplant-about = Copies macroblocks of another frame into the same places, all of them or some at random. Keyframes only take its intra blocks.
 effect-intra-mode = Intra direction
