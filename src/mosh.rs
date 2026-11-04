@@ -577,7 +577,8 @@ fn disable_deblocking(out: &mut [OutFrame]) {
     }
 }
 
-/// Range-based edit description (the command line options).
+/// Range-based edit description (the command line options). Frame numbers are display
+/// positions of the input frames, also those of the transplant effects.
 #[derive(Default)]
 pub struct MoshPlan {
     /// drop I-frames (IDR or not) whose index is in the set
@@ -606,29 +607,39 @@ pub struct MoshReport {
 impl MoshPlan {
     pub fn timeline(&self, src: &Source, report: &mut MoshReport) -> Timeline {
         let mut entries = Vec::new();
-        for &i in &src.display {
+        // effects name their donor frames by display position, the timeline by input frame
+        let effects: Vec<Fx> = self
+            .effects
+            .iter()
+            .map(|e| {
+                let input = |k: usize| src.display.get(k).copied().unwrap_or(k);
+                let effect = match *e {
+                    MbEffect::Transplant(k, amount) => MbEffect::Transplant(input(k), amount),
+                    MbEffect::MotionTransplant(k, mix) => MbEffect::MotionTransplant(input(k), mix),
+                    _ => e.clone(),
+                };
+                Fx { effect, mask: self.mask.clone() }
+            })
+            .collect();
+        for (k, &i) in src.display.iter().enumerate() {
             let au = &src.aus[i];
-            let in_drop = self.drop.as_ref().is_some_and(|r| r.contains(i));
-            let drop = in_drop || (au.is_keyframe() && self.drop_keyframes.as_ref().is_some_and(|r| r.contains(i)));
-            if drop && i == 0 {
+            let in_drop = self.drop.as_ref().is_some_and(|r| r.contains(k));
+            let drop = in_drop || (au.is_keyframe() && self.drop_keyframes.as_ref().is_some_and(|r| r.contains(k)));
+            if drop && k == 0 {
                 if in_drop {
                     report.warnings.push("frame 0 kept: the first frame must be decodable".into());
                 }
             } else if drop {
-                report.dropped.push(i);
+                report.dropped.push(k);
                 continue;
             }
-            let effects: Vec<Fx> = if self.effect_frames.as_ref().is_none_or(|r| r.contains(i)) {
-                self.effects.iter().map(|e| Fx { effect: e.clone(), mask: self.mask.clone() }).collect()
-            } else {
-                Vec::new()
-            };
-            let copies: usize = self.dup.iter().filter(|d| d.frames.contains(i)).map(|d| d.count).sum();
+            let effects = if self.effect_frames.as_ref().is_none_or(|r| r.contains(k)) { effects.clone() } else { Vec::new() };
+            let copies: usize = self.dup.iter().filter(|d| d.frames.contains(k)).map(|d| d.count).sum();
             for copy in 0..=copies {
                 entries.push(TimelineEntry { src: i, effects: effects.clone(), seed: entry_seed(self.seed, i, copy) });
             }
             if copies > 0 {
-                report.duplicated.push((i, copies));
+                report.duplicated.push((k, copies));
             }
         }
         Timeline { entries }

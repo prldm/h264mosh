@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use h264mosh::effects::{Mask, MbEffect};
 use h264mosh::mb::{self, MbContext, MbType};
-use h264mosh::mosh::{MoshPlan, decode_pocs, mosh};
+use h264mosh::mosh::{MoshPlan, decode_pocs, display_order, mosh};
 use h264mosh::motion;
 use h264mosh::nal::nal_type_name;
 use h264mosh::pipeline::{self, BPyramid, EncodeSettings, PrepProgress, Tools};
@@ -74,7 +74,7 @@ enum Cmd {
         #[arg(long, value_name = "K=V:K=V")]
         x264_params: Option<String>,
     },
-    /// Edit frames at the bitstream level (frame numbers are 0-based, decode order; the output keeps display order)
+    /// Edit frames at the bitstream level (frame numbers are 0-based, in display order)
     Mosh {
         input: PathBuf,
         #[arg(short, long)]
@@ -166,10 +166,10 @@ struct FxArgs {
     /// code every intra 4x4/8x8 direction as the value N (0-7); the change cascades through prediction
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7))]
     intra_cascade: Option<u8>,
-    /// copy macroblocks of input frame FRAME into the same places, a fraction of them (default 1)
+    /// copy macroblocks of frame FRAME into the same places, a fraction of them (default 1)
     #[arg(long, value_name = "FRAME[:FRACTION]", value_parser = parse_transplant)]
     transplant: Option<(usize, f32)>,
-    /// give P-frames the motion of input frame FRAME, mixed with their own (default 1: all of it)
+    /// give P-frames the motion of frame FRAME, mixed with their own (default 1: all of it)
     #[arg(long, value_name = "FRAME[:MIX]", value_parser = parse_transplant)]
     motion_from: Option<(usize, f32)>,
     /// predict from reference frames N frames further back (needs `prep --refs`)
@@ -452,7 +452,8 @@ fn cmd_info(tools: &Tools, input: &Path, frames: bool, mbs: bool) -> Result<()> 
     }
     let count_str: Vec<String> = counts.iter().map(|(t, c)| format!("{t}: {c}")).collect();
     println!("  frames: {} ({})", aus.len(), count_str.join(", "));
-    let keyframes: Vec<usize> = (0..aus.len()).filter(|&i| aus[i].is_keyframe()).collect();
+    let display = display_order(&aus, &pocs);
+    let keyframes: Vec<usize> = (0..aus.len()).filter(|&k| aus[display[k]].is_keyframe()).collect();
     println!("  keyframes: {}", compact_list(&keyframes));
     let reordered = pocs.windows(2).zip(aus.iter().skip(1)).any(|(p, au)| !au.is_idr() && matches!(p, [Some(a), Some(b)] if b <= a));
     println!("  frame reordering: {}", if reordered { "yes (B-frames)" } else { "no" });
@@ -462,24 +463,30 @@ fn cmd_info(tools: &Tools, input: &Path, frames: bool, mbs: bool) -> Result<()> 
     } else {
         println!("  frame_num: {} violation(s) at frames {}", bad.len(), compact_list(&bad));
     }
-    let gop: String = aus.iter().take(100).map(|a| a.picture_type()).collect();
+    let gop: String = display.iter().take(100).map(|&i| aus[i].picture_type()).collect();
     println!("  first frames: {gop}{}", if aus.len() > 100 { "..." } else { "" });
 
     if mbs {
-        print_mb_stats(&aus);
+        print_mb_stats(&aus, &display);
     }
     if frames {
+        // decoding order; "frame" is the display position the other commands use
+        let mut shown_at = vec![0; aus.len()];
+        for (k, &i) in display.iter().enumerate() {
+            shown_at[i] = k;
+        }
         println!(
-            "\n  {:>6} {:>4} {:>4} {:>3} {:>9} {:>7} {:>6} {:>8}",
-            "frame", "type", "idr", "ref", "frame_num", "poc", "slices", "bytes"
+            "\n  {:>6} {:>6} {:>4} {:>4} {:>3} {:>9} {:>7} {:>6} {:>8}",
+            "decode", "frame", "type", "idr", "ref", "frame_num", "poc", "slices", "bytes"
         );
         for (i, au) in aus.iter().enumerate() {
             let (fnum, poc) = au
                 .first_slice()
                 .map_or(("-".into(), "-".into()), |s| (s.header.frame_num.to_string(), pocs[i].map_or("-".into(), |p| p.to_string())));
             println!(
-                "  {:>6} {:>4} {:>4} {:>3} {:>9} {:>7} {:>6} {:>8}",
+                "  {:>6} {:>6} {:>4} {:>4} {:>3} {:>9} {:>7} {:>6} {:>8}",
                 i,
+                shown_at[i],
                 au.picture_type(),
                 if au.is_idr() { "yes" } else { "" },
                 au.nal_ref_idc(),
@@ -526,12 +533,13 @@ fn frame_mb_stats(au: &AccessUnit) -> Result<MbStats> {
     Ok(st)
 }
 
-/// Per frame: intra / inter / skipped macroblocks and mean motion of P-frames.
-fn print_mb_stats(aus: &[AccessUnit]) {
-    let stats: Vec<Result<MbStats>> = aus.par_iter().map(frame_mb_stats).collect();
+/// Per frame in display order: intra / inter / skipped macroblocks and mean motion of
+/// P-frames.
+fn print_mb_stats(aus: &[AccessUnit], display: &[usize]) {
+    let mut stats: Vec<Option<Result<MbStats>>> = aus.par_iter().map(frame_mb_stats).map(Some).collect();
     println!();
     println!("  {:>6} {:>4} {:>7} {:>7} {:>7} {:>9}", "frame", "type", "intra", "inter", "skip", "mean |mv|");
-    for (i, (au, st)) in aus.iter().zip(stats).enumerate() {
+    for (i, (au, st)) in display.iter().map(|&d| (&aus[d], stats[d].take().expect("each frame once"))).enumerate() {
         match st {
             Ok(st) => {
                 let mean = st.mean_mv.map_or("-".into(), |m| format!("{m:.2} px"));
