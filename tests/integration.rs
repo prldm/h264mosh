@@ -251,13 +251,23 @@ fn motion_prediction_restructure_keeps_pixels() {
     if !ffmpeg_available() {
         return;
     }
-    let configs: &[(&str, &[&str])] = &[
-        ("testsrc2", &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:ref=1:weightp=0:partitions=all"]),
-        ("mandelbrot", &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:ref=3:partitions=all:subme=9"]),
-        ("testsrc2", &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:ref=4:weightp=2:slices=3:partitions=all"]),
-        ("mandelbrot", &["-coder", "0", "-pix_fmt", "yuv444p", "-x264-params", "bframes=0:ref=2:8x8dct=0"]),
+    let configs = [
+        ("testsrc2", "yuv420p", "bframes=0:ref=1:weightp=0:partitions=all"),
+        ("mandelbrot", "yuv420p", "bframes=0:ref=3:partitions=all:subme=9"),
+        ("testsrc2", "yuv420p", "bframes=0:ref=4:weightp=2:slices=3:partitions=all"),
+        ("mandelbrot", "yuv444p", "bframes=0:ref=2:8x8dct=0"),
+        ("mandelbrot", "yuv420p", "bframes=0:ref=2:partitions=all"),
     ];
-    for (source, args) in configs {
+    for (source, pix, params) in configs {
+        for coder in ["0", "1"] {
+            let args = ["-coder", coder, "-pix_fmt", pix, "-x264-params", params];
+            restructure_keeps_pixels(source, &args);
+        }
+    }
+}
+
+fn restructure_keeps_pixels(source: &str, args: &[&str]) {
+    {
         let data = encode(source, 2, args);
         let (orig, _) = decode(&data, "restructure_orig.264");
         for effects in [
@@ -285,7 +295,13 @@ fn macroblock_effects_decode_cleanly() {
     if !ffmpeg_available() {
         return;
     }
-    let data = encode("mandelbrot", 2, &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:ref=2:partitions=all"]);
+    for coder in ["0", "1"] {
+        macroblock_effects_decode_cleanly_with(coder);
+    }
+}
+
+fn macroblock_effects_decode_cleanly_with(coder: &str) {
+    let data = encode("mandelbrot", 2, &["-coder", coder, "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:ref=2:partitions=all"]);
     let (orig, _) = decode(&data, "fx_orig.264");
     let cases: &[&[MbEffect]] = &[
         &[MbEffect::MvScale(2.0, -1.0)],
@@ -560,12 +576,12 @@ fn remux_keeps_the_moshed_pictures() {
     assert!(md5 == raw, "remuxed pictures differ");
 }
 
-/// CAVLC streams covering what the new macroblock effects depend on: 4x4 and 8x8
-/// transforms, slices, constrained intra prediction, chroma formats, bit depth,
-/// scaling matrices and several reference frames.
-fn cavlc_configs() -> Vec<(&'static str, Vec<u8>)> {
-    let x = |params: &str, extra: &[&'static str]| {
-        let mut args = vec!["-coder", "0", "-g", "25", "-x264-params"];
+/// Streams covering what the new macroblock effects depend on: 4x4 and 8x8 transforms,
+/// slices, constrained intra prediction, chroma formats, bit depth, scaling matrices
+/// and several reference frames, each with CAVLC and with CABAC.
+fn mb_configs() -> Vec<(String, Vec<u8>)> {
+    let x = |coder: &'static str, params: &str, extra: &[&'static str]| {
+        let mut args = vec!["-coder", coder, "-g", "25", "-x264-params"];
         let params = format!("bframes=0:weightp=0:scenecut=0:{params}");
         args.push(&params);
         args.extend_from_slice(extra);
@@ -573,16 +589,22 @@ fn cavlc_configs() -> Vec<(&'static str, Vec<u8>)> {
         args.extend(pix);
         encode("testsrc2", 2, &args)
     };
-    vec![
-        ("8x8", x("ref=1", &[])),
-        ("4x4", x("ref=1:8x8dct=0", &[])),
-        ("slices+constrained", x("ref=1:slices=3:constrained-intra=1", &[])),
-        ("ref3", x("ref=3", &[])),
-        ("cqm", x("ref=1:cqm=jvt", &[])),
-        ("i444", x("ref=1", &["-pix_fmt", "yuv444p"])),
-        ("i422", x("ref=1", &["-pix_fmt", "yuv422p"])),
-        ("10bit", x("ref=1", &["-pix_fmt", "yuv420p10le"])),
-    ]
+    let mut v = Vec::new();
+    for (coder, entropy) in [("0", "cavlc"), ("1", "cabac")] {
+        for (name, params, extra) in [
+            ("8x8", "ref=1", &[][..]),
+            ("4x4", "ref=1:8x8dct=0", &[]),
+            ("slices+constrained", "ref=1:slices=3:constrained-intra=1", &[]),
+            ("ref3", "ref=3", &[]),
+            ("cqm", "ref=1:cqm=jvt", &[]),
+            ("i444", "ref=1", &["-pix_fmt", "yuv444p"]),
+            ("i422", "ref=1", &["-pix_fmt", "yuv422p"]),
+            ("10bit", "ref=1", &["-pix_fmt", "yuv420p10le"]),
+        ] {
+            v.push((format!("{name} {entropy}"), x(coder, params, extra)));
+        }
+    }
+    v
 }
 
 /// Every new macroblock effect, on every frame: the result decodes without a single
@@ -610,11 +632,11 @@ fn new_effects_decode_cleanly() {
         MbEffect::MotionTransplant(40, 1.0),
         MbEffect::MotionTransplant(12, 0.5),
     ];
-    for (name, data) in cavlc_configs() {
+    for (name, data) in mb_configs() {
         let (orig, _) = decode(&data, "new_fx_orig.264");
         let mut cases: Vec<Vec<MbEffect>> = effects.iter().map(|e| vec![e.clone()]).collect();
         cases.push(vec![MbEffect::QpAdd(30), MbEffect::Coeffs(0.0, 8.0), MbEffect::DcShift(60, 60, 60)]);
-        if name == "ref3" {
+        if name.starts_with("ref3") {
             cases.push(vec![MbEffect::RefShift(2)]);
         }
         for fx in cases {
@@ -636,7 +658,7 @@ fn identity_effects_are_bit_exact() {
     if !ffmpeg_available() {
         return;
     }
-    for (name, data) in cavlc_configs() {
+    for (name, data) in mb_configs() {
         for fx in
             [MbEffect::IntraRotate(0), MbEffect::QpAdd(0), MbEffect::Coeffs(0.0, 1.0), MbEffect::RefShift(0), MbEffect::DcShift(0, 0, 0)]
         {
@@ -664,14 +686,16 @@ fn intra_directions_respect_available_samples() {
     if !ffmpeg_available() {
         return;
     }
-    let all_intra = encode("testsrc2", 1, &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "keyint=1:slices=4"]);
-    let constrained =
-        encode("mandelbrot", 1, &["-coder", "0", "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:constrained-intra=1:8x8dct=0"]);
-    for (name, data) in [("all intra", &all_intra), ("constrained", &constrained)] {
-        for d in 0..=8 {
-            let out = with_effects(data, &[MbEffect::IntraMode(d)]);
-            let (_, err) = decode(&out, "intra_dirs.264");
-            assert!(err.is_empty(), "{name}, direction {d}: {err}");
+    for coder in ["0", "1"] {
+        let all_intra = encode("testsrc2", 1, &["-coder", coder, "-pix_fmt", "yuv420p", "-x264-params", "keyint=1:slices=4"]);
+        let constrained =
+            encode("mandelbrot", 1, &["-coder", coder, "-pix_fmt", "yuv420p", "-x264-params", "bframes=0:constrained-intra=1:8x8dct=0"]);
+        for (name, data) in [("all intra", &all_intra), ("constrained", &constrained)] {
+            for d in 0..=8 {
+                let out = with_effects(data, &[MbEffect::IntraMode(d)]);
+                let (_, err) = decode(&out, "intra_dirs.264");
+                assert!(err.is_empty(), "{name}, coder {coder}, direction {d}: {err}");
+            }
         }
     }
 }
@@ -696,7 +720,13 @@ fn masked_effects_leave_the_rest_alone() {
     if !ffmpeg_available() {
         return;
     }
-    let data = mosh_friendly("mandelbrot", 1, &["-coder", "0"]);
+    for coder in ["0", "1"] {
+        masked_effects_leave_the_rest_alone_with(coder);
+    }
+}
+
+fn masked_effects_leave_the_rest_alone_with(coder: &str) {
+    let data = mosh_friendly("mandelbrot", 1, &["-coder", coder]);
     let src = Source::new(Stream::parse(&data).unwrap());
     let orig = decode_luma(&data, "mask_orig.264");
     let left_half = Mask::rect(0.0, 0.0, 0.5, 1.0);
@@ -736,7 +766,7 @@ fn residual_ranges_accept_encoder_output() {
     if !ffmpeg_available() {
         return;
     }
-    let mut streams: Vec<(&str, Vec<u8>)> = cavlc_configs();
+    let mut streams = mb_configs();
     for (name, params, pix) in [
         ("qp1", "qp=1", "yuv420p"),
         ("qp1 444", "qp=1:8x8dct=1", "yuv444p"),
@@ -745,7 +775,12 @@ fn residual_ranges_accept_encoder_output() {
         ("qp1 10bit", "qp=1", "yuv422p10le"),
     ] {
         let params = format!("bframes=0:{params}");
-        streams.push((name, encode("testsrc2", 1, &["-coder", "0", "-pix_fmt", pix, "-x264-params", &params])));
+        for coder in ["0", "1"] {
+            streams.push((
+                format!("{name} coder {coder}"),
+                encode("testsrc2", 1, &["-coder", coder, "-pix_fmt", pix, "-x264-params", &params]),
+            ));
+        }
     }
     let check = |name: &str, data: &[u8]| {
         let stream = Stream::parse(data).unwrap();
@@ -820,12 +855,8 @@ fn multi_reference_streams_survive_frame_edits() {
         // frames 1-9 dropped, frame 40 right after keyframe 25, frame 0 frozen
         let order: Vec<usize> = [0, 0].into_iter().chain(10..25).chain([25, 40]).chain(26..40).chain(41..50).collect();
         let mut timeline = Timeline { entries: order.iter().map(|&s| TimelineEntry::new(s)).collect() };
-        if extra.is_empty() {
-            // CABAC: frame edits only
-        } else {
-            for e in &mut timeline.entries[3..12] {
-                e.effects = vec![MbEffect::RefShift(2).into()];
-            }
+        for e in &mut timeline.entries[3..12] {
+            e.effects = vec![MbEffect::RefShift(2).into()];
         }
         let (out, rep) = render(&src, &timeline, &RenderOptions::default()).unwrap();
         assert!(rep.failed_effects.is_empty(), "{:?}", rep.failed_effects);
@@ -845,7 +876,13 @@ fn transplant_copies_macroblocks() {
     if !ffmpeg_available() {
         return;
     }
-    let data = mosh_friendly("mandelbrot", 2, &["-coder", "0"]);
+    for coder in ["0", "1"] {
+        transplant_copies_macroblocks_with(coder);
+    }
+}
+
+fn transplant_copies_macroblocks_with(coder: &str) {
+    let data = mosh_friendly("mandelbrot", 2, &["-coder", coder]);
     let (orig, _) = decode(&data, "transplant_orig.264");
     let src = Source::new(Stream::parse(&data).unwrap());
     let mut timeline = Timeline::identity(src.len());
@@ -998,7 +1035,7 @@ fn bframe_edits_decode_cleanly() {
         }
         // two non-reference B-frames swapped within their group show each other's picture
         if name == "b_none" {
-            let (orig, _) = decode(&data, "b_orig.264");
+            let (orig, _) = decode(&data, "b_swap_orig.264");
             let p = (1..n - 1).find(|&p| kind(p) == 'B' && kind(p + 1) == 'B' && !is_ref(p) && !is_ref(p + 1)).unwrap();
             let md5 = render_checked(&src, &shown(&src, (0..p).chain([p + 1, p]).chain(p + 2..n)), "b_swapped");
             assert_eq!((&md5[p], &md5[p + 1]), (&orig[p + 1], &orig[p]));
@@ -1109,4 +1146,108 @@ fn moved_bframes_leave_temporal_direct() {
     let last = (0..n).rev().find(|&p| temporal(&src.aus[src.display[p]])).unwrap();
     assert!(temporal(&au(last)), "a B-frame far from the edit");
     render_checked(&src, &timeline, "temporal_moved");
+}
+
+/// The same macroblocks written with CAVLC instead of CABAC: PPS switched, every
+/// slice parsed by the CABAC layer and written by the CAVLC one.
+fn to_cavlc(data: &[u8]) -> Vec<u8> {
+    let mut stream = Stream::parse(data).unwrap();
+    let cavlc = |p: &Pps| Arc::new(Pps { entropy_coding_mode_flag: false, ..p.clone() });
+    for n in stream.nals.iter_mut() {
+        match &mut n.kind {
+            NalKind::Pps(p) => *p = cavlc(p),
+            NalKind::Slice(s) => {
+                let data = h264mosh::mb::parse_slice_data(s).unwrap();
+                s.pps = cavlc(&s.pps);
+                s.header.cabac_init_idc = 0;
+                let (bytes, bits) = h264mosh::mb::write_slice_data(s, &data).unwrap();
+                s.set_slice_data(bytes, bits).unwrap();
+            }
+            _ => continue,
+        }
+        n.dirty = true;
+    }
+    stream.write(false).unwrap()
+}
+
+/// CABAC streams written again with CAVLC from the parsed macroblocks decode to the
+/// same pictures: an independent check of the CABAC parser. Edited CABAC streams
+/// decode like their macroblocks written with CAVLC, which checks the CABAC writer, and
+/// effects on a CABAC stream and on its CAVLC twin give the same pictures.
+///
+/// The exception are 8x8 blocks an effect empties: CABAC cannot code them, so the
+/// writer codes the macroblock differently (same coefficients, QP and motion), while
+/// CAVLC keeps them, and ffmpeg's CAVLC decoder then deblocks those blocks as if they
+/// had coefficients (bS 2, against 8.7.2.1). For Coeffs only the first two checks hold.
+#[test]
+fn cabac_macroblocks_match_cavlc() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let x = |source: &str, pix: &str, params: &str| encode(source, 2, &["-pix_fmt", pix, "-g", "25", "-x264-params", params]);
+    let streams = [
+        ("default", x("mandelbrot", "yuv420p", "scenecut=0")),
+        ("pyramid", x("testsrc2", "yuv420p", "bframes=4:b-pyramid=normal:ref=3:weightb=1:partitions=all")),
+        ("temporal", x("mandelbrot", "yuv420p", "bframes=3:direct=temporal:8x8dct=0")),
+        ("i444", x("testsrc2", "yuv444p", "bframes=2")),
+        ("i422 10bit", x("mandelbrot", "yuv422p10le", "bframes=2")),
+        ("gray", x("mandelbrot", "gray", "bframes=0")),
+        ("intra", x("testsrc2", "yuv420p", "keyint=1:cqm=jvt")),
+        ("lossless", x("testsrc2", "yuv420p", "qp=0:bframes=1")),
+        ("slices", x("mandelbrot", "yuv420p", "slices=3:constrained-intra=1")),
+    ];
+    let effects = [
+        vec![MbEffect::Coeffs(0.4, 0.0)],
+        vec![MbEffect::Coeffs(0.0, 0.0)],
+        vec![MbEffect::QpAdd(9), MbEffect::IntraMode(2)],
+        vec![MbEffect::MvScale(2.0, 0.5), MbEffect::KillIntra],
+        vec![MbEffect::ZeroResidual],
+    ];
+    for (name, data) in &streams {
+        let (orig, _) = decode(data, "cabac_orig.264");
+        let twin = to_cavlc(data);
+        let (md5, err) = decode(&twin, "cabac_twin.264");
+        assert!(err.is_empty(), "{name}: {err}");
+        assert_eq!(md5, orig, "{name}: the CAVLC twin decodes differently");
+        assert_bit_exact(&twin);
+        for fx in &effects {
+            let a = with_effects(data, fx);
+            let (md5_a, err) = decode(&a, "cabac_fx.264");
+            assert!(err.is_empty(), "{name} {fx:?}: {err}");
+            assert_bit_exact(&a);
+            let (md5, _) = decode(&to_cavlc(&a), "cabac_fx_twin.264");
+            assert_eq!(md5_a, md5, "{name} {fx:?}: the edited CABAC stream and its CAVLC twin differ");
+            if !matches!(fx[0], MbEffect::Coeffs(..)) {
+                let (md5, _) = decode(&with_effects(&twin, fx), "cavlc_fx.264");
+                assert_eq!(md5_a, md5, "{name} {fx:?}: the effect on CABAC and on CAVLC differs");
+            }
+        }
+    }
+}
+
+/// Macroblock effects that work on B slices (all but the motion ones) on B-frame
+/// streams, CABAC and CAVLC.
+#[test]
+fn bframe_streams_take_macroblock_effects() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let effects = [
+        vec![MbEffect::IntraMode(4)],
+        vec![MbEffect::QpAdd(12)],
+        vec![MbEffect::Coeffs(0.3, 0.0), MbEffect::DcShift(20, -20, 20)],
+        vec![MbEffect::ZeroResidual],
+        vec![MbEffect::MvScale(1.5, 1.5), MbEffect::Transplant(10, 0.5)],
+    ];
+    for (name, data) in bframe_configs() {
+        let (orig, _) = decode(&data, "b_fx_orig.264");
+        for fx in &effects {
+            let out = with_effects(&data, fx);
+            let (md5, err) = decode(&out, "b_fx.264");
+            assert!(err.is_empty(), "{name} {fx:?}: {err}");
+            assert_eq!(md5.len(), orig.len(), "{name} {fx:?}");
+            assert_ne!(md5, orig, "{name} {fx:?} had no visible effect");
+            assert_bit_exact(&out);
+        }
+    }
 }
