@@ -154,6 +154,33 @@ enum MbCheck {
     Checked { macroblocks: usize, problem: Option<String> },
 }
 
+/// Where the bins of a CABAC slice as read and as written back first differ.
+fn first_bin_difference(slice: &crate::slice::Slice) -> String {
+    let (read, _) = crate::cabac::bin_trace(slice, false);
+    let (written, err) = crate::cabac::bin_trace(slice, true);
+    match read.iter().zip(&written).position(|(a, b)| a != b) {
+        Some(i) => {
+            let (a, b) = (read[i], written[i]);
+            let ctx = |c: Option<u16>| c.map_or("bypass".into(), |c| format!("ctxIdx {c}"));
+            format!(
+                "bin {i} differs: read macroblock {} {} ({}) = {}, written macroblock {} {} ({}) = {}",
+                a.mb,
+                a.element,
+                ctx(a.ctx),
+                a.bin as u8,
+                b.mb,
+                b.element,
+                ctx(b.ctx),
+                b.bin as u8
+            )
+        }
+        None if read.len() != written.len() => {
+            format!("{} bins read, {} written{}", read.len(), written.len(), err.err().map_or(String::new(), |e| format!(" ({e:#})")))
+        }
+        None => format!("the {} bins are the same: the arithmetic coder differs", read.len()),
+    }
+}
+
 /// Parse the macroblock layer of every slice and write it back; the slice data
 /// must come out bit for bit identical. Slices are checked in parallel.
 pub fn mb_roundtrip(stream: &Stream) -> MbRoundtripReport {
@@ -177,8 +204,13 @@ pub fn mb_roundtrip(stream: &Stream) -> MbRoundtripReport {
                     let mut orig = crate::bits::BitWriter::new();
                     orig.append_bits(buf, start, end);
                     let orig_bits = orig.bit_len();
-                    (bits != orig_bits || bytes != orig.into_bytes())
-                        .then(|| format!("rewritten slice data differs ({bits} bits vs {orig_bits})"))
+                    (bits != orig_bits || bytes != orig.into_bytes()).then(|| {
+                        let mut msg = format!("rewritten slice data differs ({bits} bits vs {orig_bits})");
+                        if slice.pps.entropy_coding_mode_flag {
+                            msg = format!("{msg}; {}", first_bin_difference(slice));
+                        }
+                        msg
+                    })
                 }
             };
             MbCheck::Checked { macroblocks, problem }

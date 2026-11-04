@@ -11,6 +11,9 @@
 //! interleaved 4x4 blocks of CAVLC (7.3.5.3.1: coefficient 4 * i + j of the 8x8 block is
 //! coefficient i of 4x4 block j). Its coded_block_flag is not coded outside 4:4:4, so
 //! the writer recodes 8x8 blocks without coefficients in a way that decodes the same.
+//!
+//! For debugging, [`bin_trace`] lists every bin with its macroblock, syntax element and
+//! context, as read or as written.
 
 pub mod binarize;
 pub mod engine;
@@ -29,12 +32,18 @@ use engine::{Context, Decoder, Encoder};
 /// stream and ignores `bin`; encoding codes `bin` and returns it.
 trait Engine {
     const READ: bool;
-    fn decision(&mut self, ctx: &mut Context, bin: bool) -> bool;
+    /// a bin coded with context variable `ctx`, number `ctx_idx`
+    fn decision(&mut self, ctx_idx: usize, ctx: &mut Context, bin: bool) -> bool;
     fn bypass(&mut self, bin: bool) -> bool;
     fn terminate(&mut self, bin: bool) -> bool;
     /// The raw part of an I_PCM macroblock after its mb_type (alignment and samples:
     /// read into `mb`, or written from `src`), then the engine restarts (9.3.1.2).
     fn pcm(&mut self, ctx: &MbContext, mb: &mut Macroblock, src: Option<&Macroblock>) -> Result<()>;
+    /// Bit position in the slice data: of the next bit to read, or bits written so far.
+    fn pos(&self) -> usize;
+    /// The syntax element the next bins belong to (for tracing).
+    #[inline]
+    fn element(&mut self, _addr: usize, _name: &'static str) {}
 }
 
 struct Reader<'a> {
@@ -42,11 +51,18 @@ struct Reader<'a> {
     data: &'a [u8],
 }
 
+impl<'a> Reader<'a> {
+    fn new(slice: &'a Slice) -> Result<Self> {
+        let (data, start, _) = slice.slice_data();
+        Ok(Self { dec: Decoder::new(data, start)?, data })
+    }
+}
+
 impl Engine for Reader<'_> {
     const READ: bool = true;
 
     #[inline]
-    fn decision(&mut self, ctx: &mut Context, _: bool) -> bool {
+    fn decision(&mut self, _: usize, ctx: &mut Context, _: bool) -> bool {
         self.dec.decision(ctx)
     }
 
@@ -66,6 +82,10 @@ impl Engine for Reader<'_> {
         self.dec = Decoder::new(self.data, r.pos())?;
         Ok(())
     }
+
+    fn pos(&self) -> usize {
+        self.dec.pos()
+    }
 }
 
 struct Writer(Encoder);
@@ -74,7 +94,7 @@ impl Engine for Writer {
     const READ: bool = false;
 
     #[inline]
-    fn decision(&mut self, ctx: &mut Context, bin: bool) -> bool {
+    fn decision(&mut self, _: usize, ctx: &mut Context, bin: bool) -> bool {
         self.0.decision(ctx, bin);
         bin
     }
@@ -96,6 +116,67 @@ impl Engine for Writer {
         mb::write_pcm(self.0.writer(), ctx, src)?;
         self.0.restart();
         Ok(())
+    }
+
+    fn pos(&self) -> usize {
+        self.0.bit_len()
+    }
+}
+
+/// One bin of a [`bin_trace`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TracedBin {
+    /// macroblock address
+    pub mb: usize,
+    pub element: &'static str,
+    /// ctxIdx; 276 for bins of the terminate process, None for bypass bins
+    pub ctx: Option<u16>,
+    pub bin: bool,
+}
+
+/// An engine that records the bins going through it.
+struct Traced<'t, E> {
+    e: E,
+    addr: usize,
+    element: &'static str,
+    bins: &'t mut Vec<TracedBin>,
+}
+
+impl<E: Engine> Traced<'_, E> {
+    fn push(&mut self, ctx: Option<u16>, bin: bool) -> bool {
+        self.bins.push(TracedBin { mb: self.addr, element: self.element, ctx, bin });
+        bin
+    }
+}
+
+impl<E: Engine> Engine for Traced<'_, E> {
+    const READ: bool = E::READ;
+
+    fn decision(&mut self, ctx_idx: usize, ctx: &mut Context, bin: bool) -> bool {
+        let b = self.e.decision(ctx_idx, ctx, bin);
+        self.push(Some(ctx_idx as u16), b)
+    }
+
+    fn bypass(&mut self, bin: bool) -> bool {
+        let b = self.e.bypass(bin);
+        self.push(None, b)
+    }
+
+    fn terminate(&mut self, bin: bool) -> bool {
+        let b = self.e.terminate(bin);
+        self.push(Some(276), b)
+    }
+
+    fn pcm(&mut self, ctx: &MbContext, mb: &mut Macroblock, src: Option<&Macroblock>) -> Result<()> {
+        self.e.pcm(ctx, mb, src)
+    }
+
+    fn pos(&self) -> usize {
+        self.e.pos()
+    }
+
+    fn element(&mut self, addr: usize, name: &'static str) {
+        (self.addr, self.element) = (addr, name);
     }
 }
 
@@ -227,6 +308,8 @@ struct Coder<'a, E> {
     left: Option<Nb>,
     top: Option<Nb>,
     cur: Nb,
+    /// address of the current macroblock
+    addr: usize,
     /// field picture: field variants of the significance map contexts
     field: usize,
     qp: i32,
@@ -255,21 +338,28 @@ impl<'a, E: Engine> Coder<'a, E> {
             left: None,
             top: None,
             cur: Nb::default(),
+            addr: ctx.header.first_mb_in_slice as usize,
             field: ctx.header.field_pic_flag as usize,
             qp,
             prev_qp_delta: false,
         })
     }
 
+    /// Name the syntax element the next bins belong to (for tracing).
+    #[inline]
+    fn se(&mut self, name: &'static str) {
+        self.e.element(self.addr, name);
+    }
+
     #[inline]
     fn flag(&mut self, ctx_idx: usize, bin: bool) -> bool {
-        self.e.decision(&mut self.cx[ctx_idx], bin)
+        self.e.decision(ctx_idx, &mut self.cx[ctx_idx], bin)
     }
 
     #[inline]
     fn bin(&mut self, how: Bin, bin: bool) -> bool {
         match how {
-            Bin::Ctx(i) => self.e.decision(&mut self.cx[i], bin),
+            Bin::Ctx(i) => self.e.decision(i, &mut self.cx[i], bin),
             Bin::Bypass => self.e.bypass(bin),
             Bin::Terminate => self.e.terminate(bin),
         }
@@ -329,9 +419,11 @@ impl<'a, E: Engine> Coder<'a, E> {
         self.left = if addr.is_multiple_of(ctx.width) { None } else { self.nbs.get(addr - 1).copied() };
         self.top = if addr < ctx.width { None } else { self.nbs.get(addr - ctx.width).copied() };
         self.cur = Nb::default();
+        self.addr = addr;
         if st != SliceType::I {
             let off = if st == SliceType::B { MB_SKIP_B } else { MB_SKIP_P };
             let inc = self.inc_ab(|n| !n.skip);
+            self.se("mb_skip_flag");
             if self.flag(off + inc, m.mb_type == MbType::Skip) {
                 m.mb_type = MbType::Skip;
                 m.qp = self.qp;
@@ -350,6 +442,7 @@ impl<'a, E: Engine> Coder<'a, E> {
             m.ref_idx[0] = [0; 4];
         }
         let raw = if E::READ { 0 } else { mb::mb_type_to_raw(ctx, m)? };
+        self.se("mb_type");
         let (mb_type, intra_cbp) = mb::mb_type_from_raw(ctx, self.mb_type(raw)?)?;
         m.mb_type = mb_type;
         self.cur.intra = mb_type.is_intra();
@@ -426,6 +519,7 @@ impl<'a, E: Engine> Coder<'a, E> {
                 let d = (m.qp - self.qp).rem_euclid(modulus);
                 if d > 25 + off / 2 { d - modulus } else { d }
             };
+            self.se("mb_qp_delta");
             let delta = self.mb_qp_delta(delta)?;
             self.qp = mb::wrap_qp(self.qp + delta, off);
             self.prev_qp_delta = delta != 0;
@@ -514,6 +608,7 @@ impl<'a, E: Engine> Coder<'a, E> {
 
     fn transform_8x8(&mut self, v: bool) -> bool {
         let inc = self.inc_ab(|n| n.transform_8x8);
+        self.se("transform_size_8x8_flag");
         self.flag(TRANSFORM_8X8 + inc, v)
     }
 
@@ -522,9 +617,11 @@ impl<'a, E: Engine> Coder<'a, E> {
             if m.mb_type == MbType::INxN {
                 for k in 0..if m.transform_8x8 { 4 } else { 16 } {
                     let v = m.intra_modes[k];
+                    self.se("prev_intra_pred_mode_flag");
                     m.intra_modes[k] = if self.flag(PREV_INTRA_PRED, v < 0) {
                         -1
                     } else {
+                        self.se("rem_intra_pred_mode");
                         let how = |_, _| Bin::Ctx(REM_INTRA_PRED);
                         self.string(fixed_length(v.clamp(0, 7) as u32, 7), how, |b| match_fixed_length(b, 7))? as i8
                     };
@@ -534,6 +631,7 @@ impl<'a, E: Engine> Coder<'a, E> {
                 let inc = self.inc_ab(|n| n.intra_chroma_pred_mode != 0);
                 let how = move |i, _| Bin::Ctx(CHROMA_PRED + if i == 0 { inc } else { 3 });
                 let v = m.intra_chroma_pred_mode.min(3) as u32;
+                self.se("intra_chroma_pred_mode");
                 m.intra_chroma_pred_mode = self.string(truncated_unary(v, 3), how, |b| match_truncated_unary(b, 3))? as u8;
                 self.cur.intra_chroma_pred_mode = m.intra_chroma_pred_mode;
             }
@@ -562,6 +660,7 @@ impl<'a, E: Engine> Coder<'a, E> {
         let st = self.ctx.slice_type;
         for i in 0..4 {
             let v = m.sub_types[i] as u32;
+            self.se("sub_mb_type");
             m.sub_types[i] = if st == SliceType::B {
                 let how = |i, b: Bins| {
                     Bin::Ctx(
@@ -609,6 +708,7 @@ impl<'a, E: Engine> Coder<'a, E> {
         let b = if y > 0 { bit(&self.cur, x, y - 1) } else { self.top.as_ref().is_some_and(|n| bit(n, x, 3)) };
         let inc = a as usize + 2 * b as usize;
         let max = self.ctx.num_ref_minus1(list);
+        self.se(["ref_idx_l0", "ref_idx_l1"][list]);
         let v = self.unary(v as u32, max, |i| REF_IDX + [inc, 4, 5][i.min(2) as usize])?;
         if v > 0 {
             for yy in (y..y + h).step_by(2) {
@@ -635,6 +735,7 @@ impl<'a, E: Engine> Coder<'a, E> {
                 0
             };
             let off = MVD[comp];
+            self.se([["mvd_l0 x", "mvd_l0 y"], ["mvd_l1 x", "mvd_l1 y"]][list][comp]);
             let how = move |i: u32, b: Bins| {
                 if i < 9 && b.bits.trailing_ones() >= i { Bin::Ctx(off + [inc, 3, 4, 5, 6, 6, 6, 6, 6][i as usize]) } else { Bin::Bypass }
             };
@@ -652,6 +753,7 @@ impl<'a, E: Engine> Coder<'a, E> {
 
     /// coded_block_pattern (9.3.2.6, 9.3.3.1.1.4)
     fn coded_block_pattern(&mut self, v: u8) -> Result<u8> {
+        self.se("coded_block_pattern");
         let mut luma = 0u8;
         for b8 in 0..4 {
             // condTermFlagN is 1 when the neighbouring 8x8 block has no coded residual
@@ -826,6 +928,7 @@ impl<'a, E: Engine> Coder<'a, E> {
         let n = levels.len();
         if let Some(inc) = cbf_inc {
             let any = levels.iter().any(|&l| l != 0);
+            self.se("coded_block_flag");
             if !self.flag(CODED_BLOCK_FLAG[cat] + inc, any) {
                 return Ok(false);
             }
@@ -843,11 +946,13 @@ impl<'a, E: Engine> Coder<'a, E> {
         let mut num = n;
         for (i, l) in levels.iter_mut().enumerate().take(n - 1) {
             let (si, li) = incs(i);
+            self.se("significant_coeff_flag");
             if self.flag(sig + si, *l != 0) {
                 if E::READ {
                     // significant; the level follows below
                     *l = 1;
                 }
+                self.se("last_significant_coeff_flag");
                 if self.flag(last + li, i == last_nz) {
                     num = i + 1;
                     break;
@@ -874,7 +979,9 @@ impl<'a, E: Engine> Coder<'a, E> {
                 _ => Bin::Bypass,
             };
             let v = l.unsigned_abs().saturating_sub(1).min(i32::MAX as u32 - 1) as i32;
+            self.se("coeff_abs_level_minus1");
             let abs = self.string(ueg(v, 0, false, 14), how, |b| match_ueg(b, 0, false, 14))? + 1;
+            self.se("coeff_sign_flag");
             let neg = self.e.bypass(l < 0);
             levels[i] = if neg { -abs } else { abs };
             if abs == 1 {
@@ -889,12 +996,28 @@ impl<'a, E: Engine> Coder<'a, E> {
 
 /// Parse slice_data() of a CABAC slice.
 pub(crate) fn parse_slice_data(slice: &Slice, ctx: &MbContext) -> Result<SliceData> {
-    let (buf, start, end) = slice.slice_data();
-    let reader = Reader { dec: Decoder::new(buf, start)?, data: buf };
-    let mut c = Coder::new(reader, ctx)?;
-    let first_mb = ctx.header.first_mb_in_slice as usize;
-    let mut mbs = Vec::with_capacity(ctx.pic_size.saturating_sub(first_mb));
-    let mut addr = first_mb;
+    let mut c = Coder::new(Reader::new(slice)?, ctx)?;
+    let mbs = read_mbs(&mut c, slice)?;
+    // the arithmetic code word ends with the rbsp_stop_one_bit; then alignment bits and
+    // cabac_zero_words (0x0000) up to the end of the RBSP. The alignment bits are not
+    // checked: x264 sets the last one in about half of its frames.
+    let (buf, _, end) = slice.slice_data();
+    let stop = c.e.pos();
+    if stop > end || !BitReader::at(buf, stop - 1).flag()? {
+        bail!("slice data does not end with the rbsp_stop_one_bit");
+    }
+    if buf[stop.div_ceil(8)..end / 8].iter().any(|&b| b != 0) {
+        bail!("unexpected data after the end of the slice");
+    }
+    Ok(SliceData { first_mb: ctx.header.first_mb_in_slice as usize, mbs })
+}
+
+/// The macroblocks up to end_of_slice_flag.
+fn read_mbs<E: Engine>(c: &mut Coder<E>, slice: &Slice) -> Result<Vec<Macroblock>> {
+    let ctx = c.ctx;
+    let end = slice.slice_data().2;
+    let mut addr = ctx.header.first_mb_in_slice as usize;
+    let mut mbs = Vec::with_capacity(ctx.pic_size.saturating_sub(addr));
     loop {
         if addr >= ctx.pic_size {
             bail!("slice data runs past the end of the picture");
@@ -902,25 +1025,34 @@ pub(crate) fn parse_slice_data(slice: &Slice, ctx: &MbContext) -> Result<SliceDa
         let mut m = Macroblock::new(MbType::Skip, c.qp);
         c.macroblock(addr, &mut m, None).map_err(|e| e.context(format!("macroblock {addr}")))?;
         mbs.push(m);
+        if c.e.pos() > end {
+            bail!("slice data overran the end of the slice at macroblock {addr}");
+        }
         addr += 1;
-        if c.e.dec.pos() > end {
-            bail!("slice data overran the end of the slice at macroblock {}", addr - 1);
-        }
+        c.se("end_of_slice_flag");
         if c.e.terminate(false) {
-            break;
+            return Ok(mbs);
         }
     }
-    // the arithmetic code word ends with the rbsp_stop_one_bit; then alignment bits and
-    // cabac_zero_words (0x0000) up to the end of the RBSP. The alignment bits are not
-    // checked: x264 sets the last one in about half of its frames.
-    let stop = c.e.dec.pos();
-    if stop > end || !BitReader::at(buf, stop - 1).flag()? {
-        bail!("slice data does not end with the rbsp_stop_one_bit");
+}
+
+/// Code the macroblocks of `data`, each followed by end_of_slice_flag.
+fn write_mbs<E: Engine>(c: &mut Coder<E>, data: &SliceData) -> Result<()> {
+    let ctx = c.ctx;
+    if data.first_mb != ctx.header.first_mb_in_slice as usize {
+        bail!("slice data does not start at first_mb_in_slice");
     }
-    if buf[stop.div_ceil(8)..end / 8].iter().any(|&b| b != 0) {
-        bail!("unexpected data after the end of the slice");
+    if data.mbs.is_empty() || data.first_mb + data.mbs.len() > ctx.pic_size {
+        bail!("slice data has no or more macroblocks than the picture");
     }
-    Ok(SliceData { first_mb, mbs })
+    for (i, src) in data.mbs.iter().enumerate() {
+        let addr = data.first_mb + i;
+        let mut m = header_copy(src);
+        c.macroblock(addr, &mut m, Some(src)).map_err(|e| e.context(format!("macroblock {addr}")))?;
+        c.se("end_of_slice_flag");
+        c.e.terminate(i + 1 == data.mbs.len());
+    }
+    Ok(())
 }
 
 /// Serialize the slice data of a CABAC slice, through the rbsp_stop_one_bit, alignment
@@ -929,19 +1061,8 @@ pub(crate) fn parse_slice_data(slice: &Slice, ctx: &MbContext) -> Result<SliceDa
 /// and the cabac_zero_words are those of the current data, or more if the bin count
 /// needs them.
 pub(crate) fn write_slice_data(slice: &Slice, ctx: &MbContext, data: &SliceData) -> Result<(Vec<u8>, usize)> {
-    if data.first_mb != ctx.header.first_mb_in_slice as usize {
-        bail!("slice data does not start at first_mb_in_slice");
-    }
-    if data.mbs.is_empty() || data.first_mb + data.mbs.len() > ctx.pic_size {
-        bail!("slice data has no or more macroblocks than the picture");
-    }
     let mut c = Coder::new(Writer(Encoder::new()), ctx)?;
-    for (i, src) in data.mbs.iter().enumerate() {
-        let addr = data.first_mb + i;
-        let mut m = header_copy(src);
-        c.macroblock(addr, &mut m, Some(src)).map_err(|e| e.context(format!("macroblock {addr}")))?;
-        c.e.terminate(i + 1 == data.mbs.len());
-    }
+    write_mbs(&mut c, data)?;
     let bins = c.e.0.bin_count();
     let code_bits = c.e.0.writer().bit_len();
     let code = c.e.0.finish().into_bytes();
@@ -966,6 +1087,27 @@ pub(crate) fn write_slice_data(slice: &Slice, ctx: &MbContext, data: &SliceData)
     }
     let bits = w.bit_len();
     Ok((w.into_bytes(), bits))
+}
+
+/// Every bin of a CABAC slice, as read from it, or as written back from the parsed
+/// macroblocks (`written`). The bins up to an error are returned with it.
+pub fn bin_trace(slice: &Slice, written: bool) -> (Vec<TracedBin>, Result<()>) {
+    let mut bins = Vec::new();
+    let result = (|| {
+        let ctx = MbContext::new(slice)?;
+        if !ctx.pps.entropy_coding_mode_flag {
+            bail!("not a CABAC slice");
+        }
+        if written {
+            let data = parse_slice_data(slice, &ctx)?;
+            let e = Traced { e: Writer(Encoder::new()), addr: 0, element: "", bins: &mut bins };
+            write_mbs(&mut Coder::new(e, &ctx)?, &data)
+        } else {
+            let e = Traced { e: Reader::new(slice)?, addr: 0, element: "", bins: &mut bins };
+            read_mbs(&mut Coder::new(e, &ctx)?, slice).map(|_| ())
+        }
+    })();
+    (bins, result)
 }
 
 /// The macroblock without its residual blocks and PCM samples.

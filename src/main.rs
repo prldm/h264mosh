@@ -113,27 +113,36 @@ enum Cmd {
         /// print one line per frame
         #[arg(long)]
         frames: bool,
-        /// print macroblock statistics per frame (CAVLC streams)
+        /// print macroblock statistics per frame
         #[arg(long)]
         mbs: bool,
     },
     /// Debug: one CSV line per slice (for comparing against other parsers)
     #[command(hide = true)]
     Slices { input: PathBuf },
+    /// Debug: every CABAC bin of NAL unit NAL (macroblock, syntax element, ctxIdx, bin)
+    #[command(hide = true)]
+    Bins {
+        input: PathBuf,
+        nal: usize,
+        /// the bins as written back from the parsed macroblocks instead of as read
+        #[arg(long)]
+        written: bool,
+    },
     /// Check that parsing and re-writing reproduces the input bit for bit
     Roundtrip {
         input: PathBuf,
         /// also write the fully re-serialized stream here
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// also check the macroblock layer of CAVLC slices
+        /// also check the macroblock layer
         #[arg(long)]
         mb: bool,
     },
 }
 
-/// Macroblock effects (need a CAVLC stream: `prep --cavlc`; --deblock, --weight and
-/// --tint work on any stream). Motion vector effects apply to P-frames.
+/// Macroblock effects (not on MBAFF streams; --deblock, --weight and --tint work on any
+/// stream). Motion vector effects apply to P-frames.
 #[derive(Args)]
 struct FxArgs {
     /// multiply motion vectors by X (or X:Y)
@@ -708,6 +717,16 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        Cmd::Bins { input, nal, written } => {
+            let (_, stream) = load(&tools, &input)?;
+            let Some(slice) = stream.nals.get(nal).and_then(|n| n.slice()) else { bail!("NAL unit {nal} is not a slice") };
+            let (bins, result) = h264mosh::cabac::bin_trace(slice, written);
+            for b in &bins {
+                let ctx = b.ctx.map_or("bypass".into(), |c| c.to_string());
+                println!("{} {} {ctx} {}", b.mb, b.element, b.bin as u8);
+            }
+            result?;
         }
         Cmd::Roundtrip { input, output, mb } => cmd_roundtrip(&tools, &input, output.as_ref(), mb)?,
     }

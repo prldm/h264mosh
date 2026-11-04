@@ -1251,3 +1251,25 @@ fn bframe_streams_take_macroblock_effects() {
         }
     }
 }
+
+/// The bin trace of a CABAC slice: the same bins read and written, one
+/// end_of_slice_flag per macroblock, the last one set.
+#[test]
+fn cabac_bin_trace_lists_every_bin() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let data = encode("testsrc2", 1, &["-pix_fmt", "yuv420p", "-x264-params", "bframes=2:slices=2"]);
+    let stream = Stream::parse(&data).unwrap();
+    for s in stream.nals.iter().filter_map(|n| n.slice()) {
+        let (read, result) = h264mosh::cabac::bin_trace(s, false);
+        result.unwrap();
+        let (written, result) = h264mosh::cabac::bin_trace(s, true);
+        result.unwrap();
+        assert!(read == written);
+        let ends: Vec<_> = read.iter().filter(|b| b.element == "end_of_slice_flag").collect();
+        assert_eq!(ends.len(), h264mosh::mb::parse_slice_data(s).unwrap().mbs.len());
+        assert!(ends.iter().all(|b| b.ctx == Some(276)));
+        assert_eq!(read.last().map(|b| (b.element, b.bin)), Some(("end_of_slice_flag", true)));
+    }
+}

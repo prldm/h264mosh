@@ -268,6 +268,12 @@ impl Encoder {
         self.bins += 1;
     }
 
+    /// Bits written so far; bits the engine still holds (codILow, bitsOutstanding) are
+    /// not counted until a flush.
+    pub fn bit_len(&self) -> usize {
+        self.w.bit_len()
+    }
+
     /// Bins coded so far by decision, bypass and terminate (the slice's share of
     /// BinCountsInNALunits, 9.3.4.6).
     pub fn bin_count(&self) -> u64 {
