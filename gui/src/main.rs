@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod edit;
 mod export;
 mod history;
@@ -14,6 +15,7 @@ mod panel;
 mod preview;
 mod project;
 mod settings;
+mod timebar;
 mod timeline;
 
 use eframe::egui;
@@ -22,10 +24,15 @@ use eframe::egui;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// The app icon at 256x256, RGBA (rendered from assets/icon.svg by build.rs).
+const ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.rgba"));
+
 fn main() -> eframe::Result {
+    let icon = egui::IconData { rgba: ICON.to_vec(), width: 256, height: 256 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(tr!("app-title"))
+            .with_icon(icon)
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()

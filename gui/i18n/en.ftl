@@ -14,9 +14,8 @@ open-tooltip = Open a project, or video clips: they are re-encoded for moshing, 
 menu-file = File
 menu-open = Open…
 menu-recent = Open recent
-menu-save = Save
-menu-save-as = Save as…
-menu-export = Export…
+menu-save = Save project
+menu-export = Export video…
 menu-new-clips = New clips
 import-as-coded = Keep the original coding: CABAC, MBAFF (experimental)
 import-as-coded-tooltip = Clips opened from now on are not re-encoded: their H.264 stream is used exactly as the camera or encoder made it, and nothing is asked about encoding. Clips joined this way have to be coded alike. Macroblock effects on CABAC streams are new; interlaced MBAFF streams take frame edits and the picture effects only. Without this, clips are encoded to CAVLC for moshing, as chosen when they are opened (raw CAVLC streams are used as they are).
@@ -24,12 +23,15 @@ menu-edit = Edit
 menu-undo = Undo
 menu-redo = Redo
 menu-drop-keyframes = Drop keyframes
+menu-delete-keeps-length = Deleting keeps the length
+menu-delete-keeps-length-tooltip = A deleted frame is replaced by the frame after it, shown once more (at the end, by the frame before it), so everything after it stays at its time and in step with the sound. Its motion is applied twice, which smears further. Switched off, deleted frames are cut out and the video gets shorter.
 menu-help = Help
 menu-shortcuts = Keyboard shortcuts
 filter-all = Projects and videos
 filter-project = h264mosh project
 filter-video = Video
 filter-mp4 = MP4 video
+filter-mkv = Matroska video
 filter-raw = Raw H.264 stream
 
 ## Encoding new clips (asked when they are opened)
@@ -76,8 +78,8 @@ render-button = Render
 render-tooltip = Apply the pending changes (R). Deleted frames are removed; the preview shows the result.
 auto-render = Auto
 auto-render-tooltip = Render automatically after each change.
-export-button = Export…
-export-tooltip = Save the last render as a video file or as a raw H.264 stream.
+export-button = Export video…
+export-tooltip = Save the last render as an MP4 or MKV video, or as a raw H.264 stream.
 export-pending-tooltip = Render the pending changes first.
 
 ## Background jobs and messages
@@ -112,7 +114,7 @@ unsaved-discard = Don't save
 ## Timeline
 
 delete-button = Delete
-delete-tooltip = Delete the selected frames (Del). They stay as empty slots until the next render.
+delete-tooltip = Delete the selected frames (Del). They stay as empty slots until the next render; the frame after them takes their place if Edit ▸ Deleting keeps the length is on.
 restore-button = Restore
 restore-tooltip = Bring back the selected deleted frames.
 duplicate-button = Duplicate
@@ -125,7 +127,7 @@ selection-count =
        *[other] { $count } frames selected
     }
 zoom-label = Zoom
-zoom-tooltip = Ctrl + mouse wheel over the timeline zooms too.
+zoom-tooltip = All the way left, the whole timeline is in view. Ctrl + mouse wheel over the timeline zooms too.
 copies-badge = ×{ $count }
 frame-number = { NUMBER($n, useGrouping: "false") }
 frame-range = { NUMBER($from, useGrouping: "false") }–{ NUMBER($to, useGrouping: "false") }
@@ -139,8 +141,16 @@ frame-type-p = P-frame
 frame-type-b = B-frame
 frame-type-unknown = unknown frame type
 card-tooltip = Source frame { NUMBER($frame, useGrouping: "false") } · { $kind }
+card-tooltip-output = Output frame { NUMBER($frame, useGrouping: "false") } at { $time }
+card-tooltip-output-range = Output frames { NUMBER($from, useGrouping: "false") }–{ NUMBER($to, useGrouping: "false") } from { $time }
 card-tooltip-copies = Shown { $count } times
 card-tooltip-deleted = Deleted: removed at the next render
+card-tooltip-deleted-fill = Deleted: at the next render, the frame after it takes its place
+card-tooltip-filling =
+    { $count ->
+        [one] 1 of them in place of a deleted frame
+       *[other] { $count } of them in place of deleted frames
+    }
 card-tooltip-pending = Changed, not rendered yet
 card-tooltip-removed = Deleted here: { $frames }
 
@@ -285,20 +295,32 @@ preview-source = source frame { NUMBER($frame, useGrouping: "false") }
 original-button = Original
 original-tooltip = Hold to see the frame without the mosh (or hold \).
 original-label = Original
+sound-tooltip = Sound on or off. The clips' sound plays at normal speed, at its own time: frames cut out, repeated or moved do not move it.
+sound-failed = No sound: { $reason }
+timebar-tooltip = Frame { NUMBER($frame, useGrouping: "false") } at { $time } · source frame { NUMBER($source, useGrouping: "false") }, { $kind }
 
 ## Export
 
-export-title = Export
-export-baked = Video, mosh baked in
+export-title = Export video
+export-format = Format
+export-mp4 = MP4
+export-mkv = MKV
+export-raw = H.264 stream
+export-mp4-about = Plays almost everywhere.
+export-mkv-about = Takes any audio and subtitles as they are.
+export-raw-about = The moshed stream itself (.264), bit for bit, and nothing else.
+export-video = Video
+export-baked = Mosh baked in
 export-baked-about = Decoded and encoded again: plays, seeks and edits like any video. This is what the preview shows.
 export-quality = Quality
 quality-high = High
 quality-lossless = Lossless (large, for further editing)
 quality-small = Smaller file
-export-copy = Video, moshed stream as it is
-export-copy-about = The moshed stream in an MP4 without re-encoding. Players decode the mosh themselves; seeking and editors may struggle.
-export-raw = Raw H.264 stream (.264)
-export-raw-about = The moshed stream itself, bit for bit.
+export-moshed = Moshed stream as it is
+export-moshed-about = Not encoded again. Players decode the mosh themselves; seeking and editors may struggle.
+export-keep-tracks = Keep the other tracks (audio, subtitles)
+export-keep-tracks-about = The clips' audio and subtitles go along unchanged and end with the video. They keep their own time: frames cut out, repeated or moved do not move them (deleting that keeps the length keeps them in step). From several clips, the first audio track of each is joined.
+export-no-tracks = Raw H.264 streams have no other tracks.
 export-choose-file = Choose file…
 
 ## Keyboard shortcuts
@@ -314,3 +336,4 @@ shortcut-bloom = One copy more / less; hold B and scroll to change the count
 shortcut-render = Render
 shortcut-deselect = Clear the selection
 shortcut-select-all = Select all
+shortcut-save-as = Save the project under another name

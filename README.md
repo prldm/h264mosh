@@ -37,7 +37,8 @@ Doing this on the stream, instead of on decoded pixels, means the effects are re
 
 A desktop app (Rust, egui) built around the idea that nothing is final and everything can be seen:
 
-- A frame timeline you can zoom from thumbnails down to a barcode of I and P frames, with deleted frames kept as empty slots until you render.
+- A frame timeline you can zoom from thumbnails out to the whole clip in view, a barcode of I and P frames, with deleted frames kept as empty slots until you render; a time bar under the preview to scrub through the result. Hovering tells the time and the frame.
+- Deleting can keep the length: the frame after a deleted one is shown in its place, so its motion is applied twice and everything after it stays at its time.
 - Direct manipulation: select, drag, duplicate, delete, with unlimited undo and project files.
 - Effect lanes under the frames, with draggable edges, parameters and bypass.
 - Showing the invisible: motion vector overlay, a motion curve, and a meter of how much of each frame is intra coded (how fast it heals).
@@ -45,7 +46,8 @@ A desktop app (Rust, egui) built around the idea that nothing is final and every
 - Ramps (parameters that change over time) and presets.
 - Previews decoded in the background at reduced size, by the same software decoder that is used for the export, so what you see is what you get.
 - Clips are re-encoded to CAVLC when they are opened, the most tested path, in the way they should mosh: motion from flowing (whole blocks move together, steady from frame to frame) to detailed, healing from slow to fast (how soon the real picture breaks through), B-frames and reference frames. An experimental option keeps their original coding (CABAC, MBAFF) and uses their streams exactly as they are.
-- Export as a raw stream, as the moshed stream in an MP4 without re-encoding, or as an ordinary video with the mosh baked in.
+- The clips' sound plays with the preview, at its own time.
+- Export as MP4 or MKV, with the mosh baked in or as the moshed stream itself, keeping the clips' audio and subtitles; or as a raw H.264 stream.
 - The interface is English, but written to be translated from the start.
 
 ### Command line
@@ -54,7 +56,7 @@ The same engine for scripting: prepare clips, mosh them with a plan, inspect str
 
 ### Later, bigger
 
-- Audio.
+- Sound that is edited along with the frames (now it keeps its own time).
 
 ## Principles
 

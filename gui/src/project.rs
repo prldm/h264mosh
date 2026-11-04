@@ -2,7 +2,7 @@
 //! heavy work and run on job threads.
 
 use crate::edit::{CardId, Cards, EditState, RenderSnapshot};
-use crate::export::{ExportFormat, ExportSettings};
+use crate::export::{Container, ExportSettings, VideoCoding};
 use crate::history::History;
 use crate::jobs::{Reporter, Stage};
 use anyhow::{Context, Result, bail};
@@ -99,6 +99,8 @@ pub struct Project {
     pub file: Option<PathBuf>,
     /// the clips it was made from
     pub inputs: Vec<PathBuf>,
+    /// frames each clip gives in the stream; empty if not known
+    pub clip_frames: Vec<usize>,
     /// the raw stream the edit is based on, its hash, and how it was made
     pub stream_path: PathBuf,
     pub stream_hash: u64,
@@ -131,6 +133,17 @@ impl Project {
         fit(self.size, PREVIEW_BOX)
     }
 
+    /// The clips with the frames each gives in the stream, if known.
+    pub fn clips(&self) -> Option<Vec<(PathBuf, usize)>> {
+        (self.clip_frames.len() == self.inputs.len()).then(|| self.inputs.iter().cloned().zip(self.clip_frames.iter().copied()).collect())
+    }
+
+    /// Whether the clips can have other tracks (audio, subtitles): some of them are not
+    /// raw streams, and where each begins is known.
+    pub fn has_tracks(&self) -> bool {
+        self.clips().is_some() && self.inputs.iter().any(|p| !pipeline::is_raw_h264(p))
+    }
+
     /// Edited since it was last saved (or never saved).
     pub fn is_dirty(&self) -> bool {
         self.saved.as_ref().is_none_or(|s| !self.cards.is_state(s))
@@ -142,6 +155,7 @@ impl Project {
             format: FORMAT.into(),
             version: VERSION,
             inputs: self.inputs.clone(),
+            clip_frames: self.clip_frames.clone(),
             stream: self.stream_path.clone(),
             stream_hash: format!("{:016x}", self.stream_hash),
             encoding: self.encoding.clone(),
@@ -181,6 +195,9 @@ struct ProjectFile {
     format: String,
     version: u32,
     inputs: Vec<PathBuf>,
+    /// frames each input gives in the stream
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    clip_frames: Vec<usize>,
     /// the raw stream the edit is based on
     stream: PathBuf,
     stream_hash: String,
@@ -245,11 +262,14 @@ fn new_stream_file(inputs: &[PathBuf], cache_dir: &Path) -> Result<PathBuf> {
     Ok(cache_dir.join(format!("{stem}-{stamp}.264")))
 }
 
+/// A stream file, its data, and the frames each clip gives in it (empty if not known).
+type Prepared = (PathBuf, Vec<u8>, Vec<usize>);
+
 /// Encode `inputs` into a new stream file in `cache_dir`.
-fn prepare(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: &Encoding, r: &Reporter) -> Result<(PathBuf, Vec<u8>)> {
+fn prepare(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: &Encoding, r: &Reporter) -> Result<Prepared> {
     let output = new_stream_file(inputs, cache_dir)?;
     let (mut clip, mut clip_frames) = (0, None);
-    pipeline::prep(tools, inputs, &output, None, None, &encoding.settings(), &mut |p| {
+    let clips = pipeline::prep(tools, inputs, &output, None, None, &encoding.settings(), &mut |p| {
         match p {
             PrepProgress::Start { .. } => {}
             PrepProgress::Clip { index, frames, .. } => (clip, clip_frames) = (index, frames),
@@ -259,21 +279,22 @@ fn prepare(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: &Encod
     })?;
     r.set(Stage::Reading, 0, None);
     let data = std::fs::read(&output).with_context(|| format!("reading {}", output.display()))?;
-    Ok((output, data))
+    Ok((output, data, clips.iter().map(|c| c.frames).collect()))
 }
 
 /// The H.264 streams of `inputs` as they are coded, one after the other: a single raw
 /// stream is used where it is, anything else is copied into a new stream file in
 /// `cache_dir`.
-fn copy(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, r: &Reporter) -> Result<(PathBuf, Vec<u8>)> {
+fn copy(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, r: &Reporter) -> Result<Prepared> {
     if let [single] = inputs
         && pipeline::is_raw_h264(single)
     {
         r.set(Stage::Reading, 0, None);
         let data = std::fs::read(single).with_context(|| format!("reading {}", single.display()))?;
-        return Ok((single.clone(), data));
+        return Ok((single.clone(), data, Vec::new()));
     }
     let mut joined = Vec::new();
+    let mut frames = Vec::new();
     let mut first: Option<Sps> = None;
     for (i, input) in inputs.iter().enumerate() {
         if r.cancelled() {
@@ -293,11 +314,12 @@ fn copy(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, r: &Reporter) -> Re
             ),
             _ => {}
         }
+        frames.push(Source::new(stream).len());
         joined.extend_from_slice(&data);
     }
     let output = new_stream_file(inputs, cache_dir)?;
     std::fs::write(&output, &joined).with_context(|| format!("writing {}", output.display()))?;
-    Ok((output, joined))
+    Ok((output, joined, frames))
 }
 
 fn first_sps(stream: &Stream) -> Option<Arc<Sps>> {
@@ -315,13 +337,13 @@ fn mosh_ready(data: &[u8]) -> bool {
     })
 }
 
-/// Parse a stream into a project with an unedited timeline.
+/// Parse a stream into a project with an unedited timeline; `clip_frames` as far as
+/// known.
 fn load(
     name: String,
     inputs: Vec<PathBuf>,
-    stream_path: PathBuf,
+    (stream_path, data, clip_frames): Prepared,
     encoding: Option<Encoding>,
-    data: Vec<u8>,
     r: &Reporter,
 ) -> Result<Project> {
     if r.cancelled() {
@@ -337,6 +359,11 @@ fn load(
     }
     let frames = source.aus.iter().map(|au| FrameInfo { kind: au.picture_type(), idr: au.is_idr() }).collect();
     let fps = pipeline::stream_fps(&data);
+    let clip_frames = match clip_frames {
+        f if f.len() == inputs.len() && f.iter().sum::<usize>() == source.len() => f,
+        _ if inputs.len() == 1 => vec![source.len()],
+        _ => Vec::new(),
+    };
     let cards = Cards::new(source.display.iter().copied());
     r.set(Stage::Rendering, 0, None);
     let (timeline, _) = cards.timeline();
@@ -345,6 +372,7 @@ fn load(
         name,
         file: None,
         inputs,
+        clip_frames,
         stream_path,
         stream_hash: hash(&data),
         encoding,
@@ -375,18 +403,12 @@ pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: Opt
         }
         _ => None,
     };
-    let (stream, data, encoding) = match (raw, encoding) {
-        (Some(data), _) => (inputs[0].clone(), data, None),
-        (None, Some(encoding)) => {
-            let (stream, data) = prepare(tools, inputs, cache_dir, &encoding, r)?;
-            (stream, data, Some(encoding))
-        }
-        (None, None) => {
-            let (stream, data) = copy(tools, inputs, cache_dir, r)?;
-            (stream, data, None)
-        }
+    let (prepared, encoding) = match (raw, encoding) {
+        (Some(data), _) => ((inputs[0].clone(), data, Vec::new()), None),
+        (None, Some(encoding)) => (prepare(tools, inputs, cache_dir, &encoding, r)?, Some(encoding)),
+        (None, None) => (copy(tools, inputs, cache_dir, r)?, None),
     };
-    let project = load(name, inputs.to_vec(), stream, encoding, data, r)?;
+    let project = load(name, inputs.to_vec(), prepared, encoding, r)?;
     let rendered = project.original.clone();
     Ok(Imported { project, rendered, snapshot: None })
 }
@@ -409,15 +431,19 @@ pub fn open(tools: &Tools, path: &Path, cache_dir: &Path, r: &Reporter) -> Resul
     {
         bail!("the stream {} is gone, and so is the clip {}", file.stream.display(), missing.display());
     }
-    let (stream_path, data) = match (stored, &file.encoding) {
-        (Some(data), _) => (file.stream.clone(), data),
+    let prepared = match (stored, &file.encoding) {
+        (Some(data), _) => (file.stream.clone(), data, file.clip_frames),
         (None, Some(encoding)) => prepare(tools, &file.inputs, cache_dir, encoding, r)?,
         (None, None) if copied => copy(tools, &file.inputs, cache_dir, r)?,
         (None, None) => bail!("the stream {} is missing or was changed", file.stream.display()),
     };
-    let mut project = load(name_of(path), file.inputs, stream_path, file.encoding, data, r)?;
+    let mut project = load(name_of(path), file.inputs, prepared, file.encoding, r)?;
     if project.source.len() != file.frames {
         bail!("the clips now give {} frames instead of {}; the edit does not fit them", project.source.len(), file.frames);
+    }
+    if project.clip_frames.is_empty() {
+        // made before clips were counted: from their durations
+        project.clip_frames = estimate_clip_frames(tools, &project.inputs, project.source.len(), &project.fps);
     }
     let mut edit = file.edit;
     let effects: HashSet<_> = edit.effects.iter().map(|e| e.id).collect();
@@ -438,6 +464,24 @@ pub fn open(tools: &Tools, path: &Path, cache_dir: &Path, r: &Reporter) -> Resul
     r.set(Stage::Rendering, 0, None);
     let rendered = Arc::new(render(&source, &timeline, cards)?);
     Ok(Imported { project, rendered, snapshot: Some(snapshot) })
+}
+
+/// The frames each clip gives in a stream of `total` frames at `fps`, from the clips'
+/// durations; empty if one cannot be read.
+fn estimate_clip_frames(tools: &Tools, inputs: &[PathBuf], total: usize, fps: &str) -> Vec<usize> {
+    let Some(fps) = pipeline::fps_value(fps) else { return Vec::new() };
+    let durations: Option<Vec<f64>> = inputs.iter().map(|p| pipeline::probe(tools, p).ok()?.duration).collect();
+    let Some(durations) = durations else { return Vec::new() };
+    let mut frames: Vec<usize> = durations.iter().map(|d| (d * fps).round() as usize).collect();
+    // the last clip takes what is left
+    let before: usize = frames[..frames.len() - 1].iter().sum();
+    match total.checked_sub(before) {
+        Some(rest) => {
+            *frames.last_mut().expect("several clips") = rest;
+            frames
+        }
+        None => Vec::new(),
+    }
 }
 
 pub fn render(source: &Source, timeline: &Timeline, cards: Vec<CardId>) -> Result<Rendered> {
@@ -462,17 +506,27 @@ impl RenderRequest {
     }
 }
 
-/// Write the rendered stream as the settings say.
-pub fn export(tools: &Tools, rendered: &Rendered, fps: &str, path: &Path, settings: &ExportSettings, r: &Reporter) -> Result<()> {
+/// Write the rendered stream as the settings say, with the other tracks of `clips` (and
+/// the frames each gives) if given.
+pub fn export(
+    tools: &Tools,
+    rendered: &Rendered,
+    fps: &str,
+    path: &Path,
+    settings: &ExportSettings,
+    clips: Option<&[(PathBuf, usize)]>,
+    r: &Reporter,
+) -> Result<()> {
     let total = rendered.len() as u64;
     let mut progress = |n| r.set(Stage::Exporting, n, Some(total));
     progress(0);
-    match settings.format {
-        ExportFormat::Raw => std::fs::write(path, &rendered.bytes).with_context(|| format!("writing {}", path.display())),
-        ExportFormat::Copy => pipeline::remux(tools, &rendered.bytes, path, fps, None, &mut progress),
-        ExportFormat::Baked => {
+    let tracks = clips.filter(|_| settings.with_tracks()).map(|clips| pipeline::Tracks { clips, frames: rendered.len() });
+    match (settings.container, settings.video) {
+        (Container::Raw, _) => std::fs::write(path, &rendered.bytes).with_context(|| format!("writing {}", path.display())),
+        (_, VideoCoding::Moshed) => pipeline::remux(tools, &rendered.bytes, path, fps, tracks.as_ref(), &mut progress),
+        (_, VideoCoding::Baked) => {
             let (preset, crf) = settings.quality.encoder();
-            pipeline::render(tools, &rendered.bytes, path, fps, preset, crf, None, &mut progress)
+            pipeline::render(tools, &rendered.bytes, path, fps, preset, crf, tracks.as_ref(), &mut progress)
         }
     }
 }

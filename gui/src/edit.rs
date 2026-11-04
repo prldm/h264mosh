@@ -5,6 +5,11 @@
 //! re-effected cards are marked. A render compiles the list into a [`Timeline`]; when
 //! it is done, [`Cards::commit`] closes the gaps of the deletions it included.
 //!
+//! A card can be deleted keeping the length: the next card shown is repeated in its
+//! place, as often as the deleted one was shown, so everything after it stays at its
+//! time. The tombstone remembers it, so restoring the card takes the repeats back;
+//! once the deletion is rendered, the repeats become copies of that card.
+//!
 //! Effects are instances with parameters (one lane each). A card carries the ids of
 //! the effects it gets, so a moved card takes its effects along.
 
@@ -27,6 +32,9 @@ pub struct Card {
     pub copies: u32,
     /// deleted, shown as a tombstone until it is rendered
     pub deleted: bool,
+    /// deleted keeping the length: the next card is shown in its place
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fill: bool,
     /// moved since the last render
     pub moved: bool,
     /// source frames whose deletion was rendered right before this card
@@ -43,17 +51,14 @@ pub struct Card {
 impl PartialEq for Card {
     /// the content; not when it was edited
     fn eq(&self, o: &Self) -> bool {
-        (self.id, self.src, self.copies, self.deleted, self.moved) == (o.id, o.src, o.copies, o.deleted, o.moved)
+        (self.id, self.src, self.copies, self.deleted, self.fill, self.moved) == (o.id, o.src, o.copies, o.deleted, o.fill, o.moved)
             && self.removed_before == o.removed_before
             && self.effects == o.effects
     }
 }
 
-impl Card {
-    /// times the frame appears in the output
-    pub fn shown(&self) -> u32 {
-        if self.deleted { 0 } else { self.copies }
-    }
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// An effect lane: one effect with its parameters, and the area it is limited to.
@@ -114,6 +119,8 @@ struct Look {
 pub struct RenderSnapshot {
     rev: u64,
     looks: HashMap<CardId, Look>,
+    /// the card shown in place of each deleted card that keeps the length
+    fills: HashMap<CardId, CardId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -139,6 +146,7 @@ impl Cards {
                 src,
                 copies: 1,
                 deleted: false,
+                fill: false,
                 moved: false,
                 removed_before: Vec::new(),
                 effects: Vec::new(),
@@ -146,7 +154,7 @@ impl Cards {
             })
             .collect();
         let mut c = Self { cards, seed: 1, ..Default::default() };
-        c.rendered = c.cards.iter().map(|card| (card.id, c.look(card))).collect();
+        c.rendered = (0..c.len()).map(|i| (c.cards[i].id, c.look(i))).collect();
         c
     }
 
@@ -199,23 +207,60 @@ impl Cards {
             .collect()
     }
 
-    fn look(&self, card: &Card) -> Look {
-        let shown = card.shown();
+    /// Times card `i` appears in the output: its copies, and those of the deleted cards
+    /// right before it that keep the length (and after it, if it is the last one shown).
+    pub fn shown(&self, i: usize) -> u32 {
+        let card = &self.cards[i];
+        if card.deleted {
+            return 0;
+        }
+        let filled = |cards: &[Card]| -> u32 { cards.iter().filter(|c| c.fill).map(|c| c.copies).sum() };
+        let before = self.cards[..i].iter().rev().take_while(|c| c.deleted).count();
+        let mut shown = card.copies + filled(&self.cards[i - before..i]);
+        if self.cards[i + 1..].iter().all(|c| c.deleted) {
+            shown += filled(&self.cards[i + 1..]);
+        }
+        shown
+    }
+
+    /// The card shown in place of each deleted card that keeps the length (as in
+    /// [`Cards::shown`]).
+    fn fill_targets(&self) -> HashMap<CardId, CardId> {
+        let mut targets = HashMap::new();
+        let (mut waiting, mut last) = (Vec::new(), None);
+        for c in &self.cards {
+            if !c.deleted {
+                targets.extend(waiting.drain(..).map(|t| (t, c.id)));
+                last = Some(c.id);
+            } else if c.fill {
+                waiting.push(c.id);
+            }
+        }
+        if let Some(last) = last {
+            targets.extend(waiting.into_iter().map(|t| (t, last)));
+        }
+        targets
+    }
+
+    fn look(&self, i: usize) -> Look {
+        let shown = self.shown(i);
         if shown == 0 {
             return Look::default();
         }
+        let card = &self.cards[i];
         let effects = self.card_effects(card);
         let seed = effects.iter().any(|e| e.effect.is_random()).then_some(self.seed);
         Look { shown, effects, seed }
     }
 
-    /// Changed since the last render (an edit undone by hand does not count).
-    pub fn is_pending(&self, card: &Card) -> bool {
-        card.moved || self.rendered.get(&card.id).is_none_or(|r| *r != self.look(card))
+    /// Card `i` changed since the last render (an edit undone by hand does not count).
+    pub fn is_pending(&self, i: usize) -> bool {
+        let card = &self.cards[i];
+        card.moved || self.rendered.get(&card.id).is_none_or(|r| *r != self.look(i))
     }
 
     pub fn pending_count(&self) -> usize {
-        self.cards.iter().filter(|c| self.is_pending(c)).count()
+        (0..self.len()).filter(|&i| self.is_pending(i)).count()
     }
 
     fn touch(&mut self, i: usize) -> &mut Card {
@@ -233,8 +278,26 @@ impl Cards {
         }
     }
 
-    pub fn set_deleted(&mut self, ids: &HashSet<CardId>, deleted: bool) {
-        self.edit(|c| ids.contains(&c.id), |c| c.deleted = deleted);
+    /// Delete the cards `ids`; with `keep_length`, the next card is shown in their place.
+    pub fn delete(&mut self, ids: &HashSet<CardId>, keep_length: bool) {
+        self.edit(
+            |c| ids.contains(&c.id),
+            |c| {
+                c.deleted = true;
+                c.fill = keep_length;
+            },
+        );
+    }
+
+    /// Bring back the deleted cards `ids`.
+    pub fn undelete(&mut self, ids: &HashSet<CardId>) {
+        self.edit(
+            |c| ids.contains(&c.id),
+            |c| {
+                c.deleted = false;
+                c.fill = false;
+            },
+        );
     }
 
     /// Add `delta` copies to each card (clamped to 1..=MAX_COPIES).
@@ -343,7 +406,8 @@ impl Cards {
 
     /// The output frames: (card, source frame) for every shown copy.
     pub fn output(&self) -> Vec<(CardId, usize)> {
-        self.cards.iter().flat_map(|c| std::iter::repeat_n((c.id, c.src), c.shown() as usize)).collect()
+        let cards = &self.cards;
+        (0..cards.len()).flat_map(|i| std::iter::repeat_n((cards[i].id, cards[i].src), self.shown(i) as usize)).collect()
     }
 
     /// The timeline to render, and what to commit once it is rendered. Copies of a
@@ -352,8 +416,8 @@ impl Cards {
         let mut occurrences: HashMap<usize, usize> = HashMap::new();
         let mut entries = Vec::new();
         let mut looks = HashMap::new();
-        for card in &self.cards {
-            let look = self.look(card);
+        for (i, card) in self.cards.iter().enumerate() {
+            let look = self.look(i);
             for _ in 0..look.shown {
                 let n = occurrences.entry(card.src).or_default();
                 *n += 1;
@@ -361,18 +425,23 @@ impl Cards {
             }
             looks.insert(card.id, look);
         }
-        (Timeline { entries }, RenderSnapshot { rev: self.rev, looks })
+        (Timeline { entries }, RenderSnapshot { rev: self.rev, looks, fills: self.fill_targets() })
     }
 
     /// A render of `snap` is done: what it showed is now the rendered state, and cards
-    /// deleted before it are removed (leaving a marker on the next card). Edits made
-    /// while it ran stay pending.
+    /// deleted before it are removed (leaving a marker on the next card; the card shown
+    /// in place of one that keeps the length takes its copies). Edits made while it ran
+    /// stay pending.
     pub fn commit(&mut self, snap: RenderSnapshot) {
         let mut removed = Vec::new();
+        let mut filled: HashMap<CardId, u32> = HashMap::new();
         let mut kept = Vec::with_capacity(self.cards.len());
         for mut card in std::mem::take(&mut self.cards) {
             let rendered = card.rev <= snap.rev;
             if rendered && card.deleted {
+                if let Some(&target) = snap.fills.get(&card.id) {
+                    *filled.entry(target).or_default() += card.copies;
+                }
                 removed.append(&mut card.removed_before);
                 removed.push(card.src);
                 continue;
@@ -385,6 +454,11 @@ impl Cards {
                 card.removed_before = std::mem::take(&mut removed);
             }
             kept.push(card);
+        }
+        for card in &mut kept {
+            if let Some(n) = filled.get(&card.id) {
+                card.copies = (card.copies + n).min(MAX_COPIES);
+            }
         }
         self.removed_at_end.append(&mut removed);
         self.cards = kept;
@@ -411,13 +485,13 @@ mod tests {
     }
 
     fn pending(c: &Cards) -> Vec<usize> {
-        c.cards.iter().filter(|k| c.is_pending(k)).map(|k| k.src).collect()
+        (0..c.len()).filter(|&i| c.is_pending(i)).map(|i| c.cards[i].src).collect()
     }
 
     #[test]
     fn delete_leaves_a_tombstone_until_rendered() {
         let mut c = Cards::new(0..5);
-        c.set_deleted(&ids(&[1, 2]), true);
+        c.delete(&ids(&[1, 2]), false);
         assert_eq!(c.len(), 5);
         assert_eq!(srcs(&c), [0, 3, 4]);
         assert_eq!(c.pending_count(), 2);
@@ -429,10 +503,49 @@ mod tests {
     }
 
     #[test]
+    fn deleting_can_keep_the_length() {
+        let mut c = Cards::new(0..6);
+        c.add_copies(&ids(&[2]), 1);
+        // 1 and 2 (twice) are filled by 3; 4 is gone; 5, the last, fills itself
+        c.delete(&ids(&[1, 2]), true);
+        c.delete(&ids(&[4]), false);
+        assert_eq!(srcs(&c), [0, 3, 3, 3, 3, 5]);
+        assert_eq!(pending(&c), [1, 2, 3, 4]);
+        // restored, 2 is the next card shown after 1
+        c.undelete(&ids(&[2]));
+        assert_eq!(srcs(&c), [0, 2, 2, 2, 3, 5]);
+        c.delete(&ids(&[2]), true);
+        c.delete(&ids(&[5]), true);
+        assert_eq!(srcs(&c), [0, 3, 3, 3, 3, 3]);
+        // rendered, the repeats are copies of 3
+        let tl = render(&mut c);
+        assert_eq!(tl.entries.len(), 6);
+        assert_eq!(c.cards.iter().map(|k| (k.src, k.copies)).collect::<Vec<_>>(), [(0, 1), (3, 5)]);
+        assert_eq!((c.pending_count(), srcs(&c).len()), (0, 6));
+        // at the end the card before is repeated; with nothing shown, nothing is
+        c.delete(&ids(&[3]), true);
+        assert_eq!(srcs(&c), [0; 6]);
+        c.delete(&ids(&[0]), true);
+        assert!(srcs(&c).is_empty());
+    }
+
+    #[test]
+    fn a_fill_deleted_during_a_render_still_keeps_the_length() {
+        let mut c = Cards::new(0..4);
+        c.delete(&ids(&[1]), true);
+        let (_, snap) = c.timeline();
+        // while rendering, 2 (shown in place of 1) is deleted keeping the length too
+        c.delete(&ids(&[2]), true);
+        c.commit(snap);
+        assert_eq!(c.cards.iter().map(|k| (k.src, k.copies, k.deleted)).collect::<Vec<_>>(), [(0, 1, false), (2, 2, true), (3, 1, false)]);
+        assert_eq!(srcs(&c), [0, 3, 3, 3]);
+    }
+
+    #[test]
     fn restoring_or_undoing_by_hand_is_not_pending() {
         let mut c = Cards::new(0..3);
-        c.set_deleted(&ids(&[1]), true);
-        c.set_deleted(&ids(&[1]), false);
+        c.delete(&ids(&[1]), false);
+        c.undelete(&ids(&[1]));
         c.add_copies(&ids(&[2]), 3);
         c.add_copies(&ids(&[2]), -3);
         let fx = c.add_effect(MbEffect::KillIntra, &ids(&[0]));
@@ -477,7 +590,7 @@ mod tests {
     #[test]
     fn markers_stay_in_place_when_cards_move() {
         let mut c = Cards::new(0..5);
-        c.set_deleted(&ids(&[1]), true);
+        c.delete(&ids(&[1]), false);
         render(&mut c);
         // [0 | 2 3 4], the marker sits on card 2; a move onto itself keeps it there
         assert!(!c.move_to(&ids(&[2]), 1));
@@ -487,10 +600,10 @@ mod tests {
         assert_eq!(c.cards[1].removed_before, [1]);
         assert!(c.cards[3].removed_before.is_empty());
         // deleting the card that carries markers passes them on
-        c.set_deleted(&ids(&[3]), true);
+        c.delete(&ids(&[3]), false);
         render(&mut c);
         assert_eq!(c.cards[1].removed_before, [1, 3]);
-        c.set_deleted(&ids(&[4, 2]), true);
+        c.delete(&ids(&[4, 2]), false);
         render(&mut c);
         assert_eq!(c.removed_at_end, [1, 3, 4, 2]);
     }
@@ -498,11 +611,11 @@ mod tests {
     #[test]
     fn edits_made_during_a_render_stay_pending() {
         let mut c = Cards::new(0..4);
-        c.set_deleted(&ids(&[1]), true);
+        c.delete(&ids(&[1]), false);
         let (_, snap) = c.timeline();
         // while rendering: delete 2, restore 1, move 3
-        c.set_deleted(&ids(&[2]), true);
-        c.set_deleted(&ids(&[1]), false);
+        c.delete(&ids(&[2]), false);
+        c.undelete(&ids(&[1]));
         c.move_to(&ids(&[3]), 0);
         c.commit(snap);
         assert_eq!(c.len(), 4, "1 was restored, 2 deleted after the snapshot");
@@ -578,7 +691,8 @@ mod tests {
     fn state_roundtrips_through_json_and_restore() {
         let mut c = Cards::new(0..5);
         c.add_effect(MbEffect::MvAdd(4, -2), &ids(&[1, 2]));
-        c.set_deleted(&ids(&[3]), true);
+        c.delete(&ids(&[3]), false);
+        c.delete(&ids(&[1]), true);
         c.add_copies(&ids(&[4]), 2);
         let state = c.state();
         let json = serde_json::to_string(&state).unwrap();

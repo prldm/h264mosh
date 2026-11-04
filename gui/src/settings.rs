@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_RECENT: usize = 10;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// most recent first
@@ -19,9 +19,28 @@ pub struct Settings {
     pub import: ImportSettings,
     /// newly imported clips keep their coding (no re-encoding; experimental)
     pub import_as_coded: bool,
+    /// deleted frames are replaced by repeats of the next one
+    pub delete_keeps_length: bool,
+    /// no sound while playing
+    pub mute: bool,
     /// where it is stored; None keeps it in memory only (tests)
     #[serde(skip)]
     path: Option<PathBuf>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            recent: Vec::new(),
+            auto_render: false,
+            export: ExportSettings::default(),
+            import: ImportSettings::default(),
+            import_as_coded: false,
+            delete_keeps_length: true,
+            mute: false,
+            path: None,
+        }
+    }
 }
 
 /// The user's configuration folder for h264mosh.

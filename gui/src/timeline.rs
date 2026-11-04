@@ -1,7 +1,8 @@
-//! The frame strip: one card per timeline card, zoomable from thin I/P ticks up to
-//! thumbnails, with a lane per effect underneath. Click, Shift-click and Ctrl-click
-//! select, dragging moves the selection, the wheel over a card's copy badge changes its
-//! count, Ctrl+wheel zooms. The edges of an effect block can be dragged.
+//! The frame strip: one card per timeline card, zoomable from the whole timeline in
+//! view (several cards to a pixel are drawn as columns) up to thumbnails, with a lane
+//! per effect underneath. Click, Shift-click and Ctrl-click select, dragging moves the
+//! selection, the wheel over a card's copy badge changes its count, Ctrl+wheel zooms.
+//! The edges of an effect block can be dragged.
 //!
 //! Edits are not made here: they come back as [`Event`]s, so the app can record them
 //! for undo.
@@ -13,10 +14,12 @@ use crate::project::FrameInfo;
 use crate::tr;
 use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Painter, Rect, Sense, Shape, Stroke, StrokeKind, Vec2, pos2, vec2};
 use std::collections::HashSet;
+use std::ops::Range;
 
-const MIN_ZOOM: f32 = 1.5;
 /// narrower cards are plain I/P ticks without thumbnails or labels
 const DETAIL_ZOOM: f32 = 24.0;
+/// cards this many pixels wide and wider have a divider between them
+const DIVIDER_PIXELS: f32 = 3.0;
 /// height of the "not rendered" band above a card
 const BAND: f32 = 5.0;
 const MARGIN: f32 = 4.0;
@@ -30,7 +33,7 @@ const EDGE_GRAB: f32 = 6.0;
 /// wheel distance for one copy more or less
 const WHEEL_STEP: f32 = 40.0;
 
-const I_COLOR: Color32 = Color32::from_rgb(236, 142, 58);
+pub const I_COLOR: Color32 = Color32::from_rgb(236, 142, 58);
 const P_COLOR: Color32 = Color32::from_rgb(92, 104, 128);
 const B_COLOR: Color32 = Color32::from_rgb(150, 100, 190);
 const PENDING: Color32 = Color32::from_rgb(242, 200, 40);
@@ -71,6 +74,8 @@ pub struct Strip<'a> {
     pub active_effect: Option<EffectId>,
     /// the wheel changes the copies of the selection (B held)
     pub bloom: bool,
+    /// frames per second, for the times in tooltips
+    pub fps: f64,
 }
 
 /// Dragging an edge of an effect block: the effect, its lane, the block (first and
@@ -84,7 +89,8 @@ struct EdgeDrag {
 }
 
 pub struct TimelineView {
-    /// card width in points (clamped to the widest cards that fit)
+    /// points per card, divider included (clamped between the whole timeline in view
+    /// and the widest cards that fit)
     pub zoom: f32,
     /// horizontal scroll in points
     scroll: f32,
@@ -97,6 +103,7 @@ pub struct TimelineView {
     wheel: f32,
     /// geometry of the last frame
     last: Option<Layout>,
+    min_zoom: f32,
     max_zoom: f32,
 }
 
@@ -112,6 +119,7 @@ impl Default for TimelineView {
             scrollbar_drag: false,
             wheel: 0.0,
             last: None,
+            min_zoom: 1.0,
             max_zoom: 200.0,
         }
     }
@@ -121,19 +129,22 @@ impl Default for TimelineView {
 #[derive(Clone, Copy)]
 struct Layout {
     rect: Rect,
+    /// points per card, divider included
     zoom: f32,
     gap: f32,
     scroll: f32,
     card_h: f32,
     lanes: usize,
+    pixels_per_point: f32,
 }
 
 impl Layout {
-    fn new(rect: Rect, zoom: f32, scroll: f32, lanes: usize) -> Self {
-        let labels = if zoom >= DETAIL_ZOOM { LABEL } else { 0.0 };
+    fn new(rect: Rect, zoom: f32, scroll: f32, lanes: usize, pixels_per_point: f32) -> Self {
+        let gap = gap(zoom, pixels_per_point);
+        let labels = if zoom - gap >= DETAIL_ZOOM { LABEL } else { 0.0 };
         // cards fill the strip height; narrower ones show the middle of their thumbnail
         let card_h = (Self::room(rect, lanes) + LABEL - labels).max(4.0);
-        Self { rect, zoom, gap: gap(zoom), scroll, card_h, lanes }
+        Self { rect, zoom, gap, scroll, card_h, lanes, pixels_per_point }
     }
 
     /// card height when labels are shown
@@ -143,20 +154,39 @@ impl Layout {
 
     /// widest cards whose thumbnails fit the strip height
     fn max_zoom(rect: Rect, aspect: f32, lanes: usize) -> f32 {
-        (Self::room(rect, lanes) / aspect).max(MIN_ZOOM)
+        let width = Self::room(rect, lanes) / aspect;
+        (width / 0.92).min(width + 8.0).max(1.0)
     }
 
     fn slot(&self) -> f32 {
-        self.zoom + self.gap
+        self.zoom
     }
 
     fn detailed(&self) -> bool {
-        self.zoom >= DETAIL_ZOOM
+        self.zoom - self.gap >= DETAIL_ZOOM
     }
 
+    /// several cards to a pixel, drawn as columns
+    fn dense(&self) -> bool {
+        self.zoom * self.pixels_per_point < 1.0
+    }
+
+    /// `x` on the pixel grid
+    fn snap(&self, x: f32) -> f32 {
+        (x * self.pixels_per_point).round() / self.pixels_per_point
+    }
+
+    /// where the slot of card `i` begins
+    fn slot_left(&self, i: usize) -> f32 {
+        self.rect.left() + i as f32 * self.zoom - self.scroll
+    }
+
+    /// the card on whole pixels, the divider after it
     fn card_rect(&self, i: usize) -> Rect {
-        let x = self.rect.left() + i as f32 * self.slot() - self.scroll + self.gap / 2.0;
-        Rect::from_min_size(pos2(x, self.rect.top() + MARGIN + BAND + 2.0), vec2(self.zoom, self.card_h))
+        let x = self.slot_left(i);
+        let (left, right) = (self.snap(x), self.snap(x + self.zoom) - self.gap);
+        let top = self.rect.top() + MARGIN + BAND + 2.0;
+        Rect::from_min_max(pos2(left, top), pos2(right.max(left), top + self.card_h))
     }
 
     fn band_rect(&self, card: Rect) -> Rect {
@@ -229,7 +259,7 @@ impl TimelineView {
     }
 
     pub fn zoom_range(&self) -> std::ops::RangeInclusive<f32> {
-        MIN_ZOOM..=self.max_zoom
+        self.min_zoom..=self.max_zoom
     }
 
     /// Scroll the card at `index` into view.
@@ -276,17 +306,20 @@ impl TimelineView {
     pub fn show(&mut self, ui: &mut egui::Ui, s: Strip) -> Vec<Event> {
         let cards = s.cards;
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let ppp = ui.ctx().pixels_per_point();
         let lanes = cards.effects.len();
-        let max_zoom = Layout::max_zoom(rect, s.aspect, lanes);
-        self.max_zoom = max_zoom;
-        self.zoom = self.zoom.clamp(MIN_ZOOM, max_zoom);
         let len = cards.len();
+        let max_zoom = Layout::max_zoom(rect, s.aspect, lanes);
+        // zoomed out all the way, the whole timeline is in view
+        let min_zoom = (rect.width() / len.max(1) as f32).min(max_zoom);
+        (self.min_zoom, self.max_zoom) = (min_zoom, max_zoom);
+        self.zoom = self.zoom.clamp(min_zoom, max_zoom);
         let mut events = Vec::new();
 
         // the wheel zooms around the pointer, scrolls, or changes copies
         if let Some(p) = response.hover_pos() {
             let (zoom, delta) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
-            let l = Layout::new(rect, self.zoom, self.scroll, lanes);
+            let l = Layout::new(rect, self.zoom, self.scroll, lanes, ppp);
             let i = l.index_at(p.x);
             let on_badge = i < len && !cards.cards[i].deleted && l.detailed() && l.badge_rect(l.card_rect(i)).contains(p);
             let copies = if s.bloom && !self.selection.is_empty() {
@@ -295,10 +328,10 @@ impl TimelineView {
                 on_badge.then(|| (HashSet::from([cards.cards[i].id]), Gesture::Copies(cards.cards[i].id)))
             };
             if zoom != 1.0 {
-                let old_slot = self.zoom + gap(self.zoom);
-                self.zoom = (self.zoom * zoom).clamp(MIN_ZOOM, max_zoom);
+                let old = self.zoom;
+                self.zoom = (self.zoom * zoom).clamp(min_zoom, max_zoom);
                 let anchor = p.x - rect.left();
-                self.scroll = (anchor + self.scroll) * (self.zoom + gap(self.zoom)) / old_slot - anchor;
+                self.scroll = (anchor + self.scroll) * self.zoom / old - anchor;
             } else if delta != Vec2::ZERO {
                 if let Some((ids, gesture)) = copies {
                     self.wheel += delta.y + delta.x;
@@ -314,10 +347,10 @@ impl TimelineView {
             ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
         }
 
-        let content = len as f32 * (self.zoom + gap(self.zoom));
+        let content = len as f32 * self.zoom;
         let max_scroll = (content - rect.width()).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
-        let l = Layout::new(rect, self.zoom, self.scroll, lanes);
+        let l = Layout::new(rect, self.zoom, self.scroll, lanes, ppp);
         self.last = Some(l);
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
         let in_lanes = |p: egui::Pos2| l.lane_at(p.y).is_some();
@@ -437,42 +470,48 @@ impl TimelineView {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, visuals.extreme_bg_color);
         let visible = l.index_at(rect.left())..(l.index_at(rect.right()) + 1).min(len);
-        for i in visible.clone() {
-            let card = &cards.cards[i];
-            let style = CardStyle {
-                kind: s.frames[card.src].kind,
-                thumb: s.thumbs.get(card.src).and_then(Option::as_ref),
-                selected: self.selection.contains(&card.id),
-                pending: cards.is_pending(card),
-                playhead: s.playhead == Some(card.id),
-                hovered: hovered == Some(i),
-                pointer,
-            };
-            paint_card(&painter, visuals, &l, card, l.card_rect(i), &style);
-        }
-        for (k, fx) in cards.effects.iter().enumerate() {
-            let color = effect_color(k);
+        if l.dense() {
+            self.paint_columns(&painter, visuals, &l, &s, visible.clone());
+        } else {
             for i in visible.clone() {
                 let card = &cards.cards[i];
-                if !card.effects.contains(&fx.id) {
-                    continue;
-                }
-                let mut r = l.lane_rect(k, i);
-                if i + 1 < len && cards.cards[i + 1].effects.contains(&fx.id) {
-                    r.max.x += l.gap;
-                }
-                // dimmed where the effect changes nothing (frame type, bypassed)
-                let working = fx.enabled && affects(&fx.effect, s.frames[card.src].kind);
-                painter.rect_filled(r, 0.0, if working { color } else { color.gamma_multiply(0.35) });
+                let style = CardStyle {
+                    kind: s.frames[card.src].kind,
+                    thumb: s.thumbs.get(card.src).and_then(Option::as_ref),
+                    shown: cards.shown(i),
+                    selected: self.selection.contains(&card.id),
+                    pending: cards.is_pending(i),
+                    playhead: s.playhead == Some(card.id),
+                    hovered: hovered == Some(i),
+                    pointer,
+                };
+                paint_card(&painter, visuals, &l, card, l.card_rect(i), &style);
             }
-            if s.active_effect == Some(fx.id) {
-                // outline each visible block once, from its first visible card
+            for (k, fx) in cards.effects.iter().enumerate() {
+                let color = effect_color(k);
                 for i in visible.clone() {
-                    if let Some((a, b)) = block(cards, fx.id, i).filter(|&(a, _)| a == i || i == visible.start) {
-                        let r = l.lane_rect(k, a).union(l.lane_rect(k, b));
-                        painter.rect_stroke(r, 2.0, Stroke::new(1.5, visuals.strong_text_color()), StrokeKind::Outside);
+                    let card = &cards.cards[i];
+                    if !card.effects.contains(&fx.id) {
+                        continue;
                     }
+                    let mut r = l.lane_rect(k, i);
+                    if i + 1 < len && cards.cards[i + 1].effects.contains(&fx.id) {
+                        r.max.x += l.gap;
+                    }
+                    // dimmed where the effect changes nothing (frame type, bypassed)
+                    let working = fx.enabled && affects(&fx.effect, s.frames[card.src].kind);
+                    painter.rect_filled(r, 0.0, if working { color } else { color.gamma_multiply(0.35) });
                 }
+            }
+        }
+        if let Some(k) = cards.effects.iter().position(|e| Some(e.id) == s.active_effect) {
+            // outline each visible block once, from its first visible card
+            let id = cards.effects[k].id;
+            let has = |i: usize| cards.cards[i].effects.contains(&id);
+            for i in visible.clone().filter(|&i| has(i) && (i == visible.start || !has(i - 1))) {
+                let (a, b) = block(cards, id, i).expect("the card has the effect");
+                let r = l.lane_rect(k, a).union(l.lane_rect(k, b));
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5, visuals.strong_text_color()), StrokeKind::Outside);
             }
         }
         if let Some((lane, (a, b))) = resized {
@@ -493,10 +532,80 @@ impl TimelineView {
             if let Some((k, _)) = lane.filter(|&(k, i)| i < len && cards.cards[i].effects.contains(&cards.effects[k].id)) {
                 response.on_hover_text_at_pointer(effect_label(&cards.effects[k].effect, s.display));
             } else if let Some(i) = hovered {
-                response.on_hover_text_at_pointer(tooltip(cards, i, s.frames));
+                response.on_hover_text_at_pointer(tooltip(cards, i, s.frames, s.fps));
             }
         }
         events
+    }
+
+    /// Several cards to a pixel: a column per pixel, in the colour of the frames shown
+    /// in it (a keyframe wins), with the marks of any card in it.
+    fn paint_columns(&self, painter: &Painter, visuals: &egui::Visuals, l: &Layout, s: &Strip, visible: Range<usize>) {
+        let cards = s.cards;
+        let px = 1.0 / l.pixels_per_point;
+        let card = l.card_rect(visible.start);
+        let (top, bottom) = (card.top(), card.bottom());
+        let selected = visuals.selection.stroke.color;
+        let mut x = l.snap(l.slot_left(visible.start).max(l.rect.left()));
+        while x < l.rect.right() {
+            let a = l.index_at(x).max(visible.start);
+            if a >= visible.end {
+                break;
+            }
+            let column = a..(l.index_at(x + px - 0.001) + 1).min(visible.end);
+            let (mut p, mut b, mut keyframe) = (0, 0, false);
+            let (mut sel, mut pending, mut playhead, mut removed) = (false, false, false, false);
+            for i in column.clone() {
+                let card = &cards.cards[i];
+                if !card.deleted {
+                    match s.frames[card.src].kind {
+                        'I' => keyframe = true,
+                        'B' => b += 1,
+                        _ => p += 1,
+                    }
+                }
+                sel |= self.selection.contains(&card.id);
+                pending |= cards.is_pending(i);
+                playhead |= s.playhead == Some(card.id);
+                removed |= !card.removed_before.is_empty();
+            }
+            let color = if keyframe {
+                I_COLOR
+            } else if p + b == 0 {
+                visuals.weak_text_color().gamma_multiply(0.4)
+            } else {
+                P_COLOR.lerp_to_gamma(B_COLOR, b as f32 / (p + b) as f32)
+            };
+            let r = Rect::from_min_max(pos2(x, top), pos2(x + px, bottom));
+            painter.rect_filled(r, 0.0, color);
+            if pending {
+                painter.rect_filled(l.band_rect(r), 0.0, PENDING);
+            }
+            if removed {
+                painter.rect_filled(r, 0.0, visuals.error_fg_color);
+            }
+            if sel {
+                painter.rect_filled(Rect::from_min_max(pos2(x, top - 1.0), pos2(x + px, top + 2.0)), 0.0, selected);
+                painter.rect_filled(Rect::from_min_max(pos2(x, bottom - 2.0), pos2(x + px, bottom + 1.0)), 0.0, selected);
+            }
+            if playhead {
+                let tip = pos2(x + px / 2.0, top - 1.0);
+                let head = vec![tip, tip + vec2(-5.0, -6.0), tip + vec2(5.0, -6.0)];
+                painter.add(Shape::convex_polygon(head, visuals.strong_text_color(), Stroke::NONE));
+            }
+            for (k, fx) in cards.effects.iter().enumerate() {
+                let with: Vec<usize> = column.clone().filter(|&i| cards.cards[i].effects.contains(&fx.id)).collect();
+                if with.is_empty() {
+                    continue;
+                }
+                let working = fx.enabled && with.iter().any(|&i| affects(&fx.effect, s.frames[cards.cards[i].src].kind));
+                let lane = l.lane_rect(k, a);
+                let color = effect_color(k);
+                let r = Rect::from_min_max(pos2(x, lane.top()), pos2(x + px, lane.bottom()));
+                painter.rect_filled(r, 0.0, if working { color } else { color.gamma_multiply(0.35) });
+            }
+            x += px;
+        }
     }
 
     /// File-manager selection: click selects one, Ctrl toggles, Shift extends.
@@ -525,6 +634,8 @@ impl TimelineView {
 struct CardStyle<'a> {
     kind: char,
     thumb: Option<&'a egui::TextureHandle>,
+    /// times it is shown, with repeats in place of deleted cards
+    shown: u32,
     selected: bool,
     pending: bool,
     playhead: bool,
@@ -558,8 +669,8 @@ fn paint_card(painter: &Painter, visuals: &egui::Visuals, l: &Layout, card: &cra
             painter.text(b.center(), Align2::CENTER_CENTER, "↺", FontId::proportional(b.width() * 0.7), visuals.strong_text_color());
         }
     } else {
-        // stacked sheets for copies
-        for k in (1..card.copies.min(3)).rev() {
+        // stacked sheets for copies, on cards wide enough
+        for k in (1..if r.width() >= 8.0 { s.shown.min(3) } else { 1 }).rev() {
             let sheet = r.translate(vec2(3.0, -3.0) * k as f32);
             painter.rect(
                 sheet,
@@ -585,10 +696,10 @@ fn paint_card(painter: &Painter, visuals: &egui::Visuals, l: &Layout, card: &cra
             let badge = Rect::from_min_size(r.left_top(), galley.size() + vec2(6.0, 2.0));
             painter.rect_filled(badge, 2.0, kind_color(s.kind));
             painter.galley(badge.min + vec2(3.0, 1.0), galley, Color32::WHITE);
-            if card.copies > 1 || s.hovered {
+            if s.shown > 1 || s.hovered {
                 let b = l.badge_rect(r);
                 painter.rect_filled(b, 2.0, Color32::from_black_alpha(170));
-                painter.text(b.center(), Align2::CENTER_CENTER, tr!("copies-badge", count = card.copies), font.clone(), Color32::WHITE);
+                painter.text(b.center(), Align2::CENTER_CENTER, tr!("copies-badge", count = s.shown), font.clone(), Color32::WHITE);
             }
         }
     }
@@ -619,16 +730,29 @@ fn crop_uv(image: Vec2, card: Vec2) -> Rect {
     Rect::from_center_size(pos2(0.5, 0.5), vec2(w, h))
 }
 
-fn tooltip(cards: &Cards, i: usize, frames: &[FrameInfo]) -> String {
+fn tooltip(cards: &Cards, i: usize, frames: &[FrameInfo], fps: f64) -> String {
     let card = &cards.cards[i];
     let mut lines = vec![tr!("card-tooltip", frame = card.src, kind = kind_name(frames[card.src].kind))];
-    if card.copies > 1 {
-        lines.push(tr!("card-tooltip-copies", count = card.copies));
+    let shown = cards.shown(i);
+    if shown > 0 {
+        // where it is in the output, as edited (the next render puts it there)
+        let first: usize = (0..i).map(|j| cards.shown(j) as usize).sum();
+        let time = timestamp(first as f64 / fps);
+        lines.push(match shown {
+            1 => tr!("card-tooltip-output", frame = first, time = time),
+            n => tr!("card-tooltip-output-range", from = first, to = first + n as usize - 1, time = time),
+        });
+    }
+    if shown > 1 {
+        lines.push(tr!("card-tooltip-copies", count = shown));
+    }
+    if shown > card.copies {
+        lines.push(tr!("card-tooltip-filling", count = shown - card.copies));
     }
     if card.deleted {
-        lines.push(tr!("card-tooltip-deleted"));
+        lines.push(if card.fill { tr!("card-tooltip-deleted-fill") } else { tr!("card-tooltip-deleted") });
     }
-    if cards.is_pending(card) {
+    if cards.is_pending(i) {
         lines.push(tr!("card-tooltip-pending"));
     }
     if !card.removed_before.is_empty() {
@@ -637,8 +761,21 @@ fn tooltip(cards: &Cards, i: usize, frames: &[FrameInfo]) -> String {
     lines.join("\n")
 }
 
-fn gap(zoom: f32) -> f32 {
-    (zoom * 0.08).clamp(0.5, 8.0)
+/// The divider after a card: whole pixels, at least one once cards are
+/// [`DIVIDER_PIXELS`] wide, none on narrower cards.
+fn gap(zoom: f32, pixels_per_point: f32) -> f32 {
+    if zoom * pixels_per_point < DIVIDER_PIXELS {
+        return 0.0;
+    }
+    ((zoom * 0.08).min(8.0) * pixels_per_point).round().max(1.0) / pixels_per_point
+}
+
+/// "1:02.48" (minutes, seconds, hundredths), "1:02:03.48" from an hour on.
+pub fn timestamp(seconds: f64) -> String {
+    let hundredths = (seconds.max(0.0) * 100.0).round() as u64;
+    let (secs, cs) = (hundredths / 100, hundredths % 100);
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}.{cs:02}") } else { format!("{m}:{s:02}.{cs:02}") }
 }
 
 fn kind_color(kind: char) -> Color32 {
@@ -658,7 +795,7 @@ fn kind_badge(kind: char) -> String {
     }
 }
 
-fn kind_name(kind: char) -> String {
+pub fn kind_name(kind: char) -> String {
     match kind {
         'I' => tr!("frame-type-i"),
         'P' => tr!("frame-type-p"),
@@ -705,6 +842,33 @@ mod tests {
     fn frame_lists_are_compact() {
         assert_eq!(frame_list(&[9, 3, 7, 8, 3]), "3, 7–9");
         assert_eq!(frame_list(&[1200, 1201]), "1200–1201");
+    }
+
+    #[test]
+    fn dividers_are_whole_pixels_from_three_on() {
+        assert_eq!(gap(2.9, 1.0), 0.0);
+        assert_eq!(gap(3.0, 1.0), 1.0);
+        assert_eq!(gap(2.0, 1.5), 1.0 / 1.5);
+        assert_eq!(gap(100.0, 1.0), 8.0);
+        assert_eq!(gap(100.0, 1.25), 8.0);
+        // cards and dividers fall on the pixel grid
+        let rect = Rect::from_min_size(pos2(10.0, 0.0), vec2(400.0, 150.0));
+        let l = Layout::new(rect, 3.4, 0.0, 0, 1.25);
+        for i in 0..50 {
+            let r = l.card_rect(i);
+            for x in [r.left(), r.right()] {
+                assert!(((x * 1.25).round() - x * 1.25).abs() < 1e-3, "{x}");
+            }
+            assert!(l.card_rect(i + 1).left() - r.right() >= 0.8 - 1e-3, "a divider after card {i}");
+        }
+    }
+
+    #[test]
+    fn timestamps() {
+        assert_eq!(timestamp(0.0), "0:00.00");
+        assert_eq!(timestamp(62.48), "1:02.48");
+        assert_eq!(timestamp(3723.5), "1:02:03.50");
+        assert_eq!(timestamp(31.0 / 25.0), "0:01.24");
     }
 
     #[test]

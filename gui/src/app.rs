@@ -1,5 +1,6 @@
+use crate::audio::Audio;
 use crate::edit::{CardId, Cards, EffectId, RenderSnapshot};
-use crate::export::{self, ExportSettings};
+use crate::export::{self, Container, ExportSettings};
 use crate::history::Gesture;
 use crate::import::{self, ImportSettings};
 use crate::jobs::{Feed, Job, Stage};
@@ -7,6 +8,7 @@ use crate::panel::{self, Action};
 use crate::preview::Preview;
 use crate::project::{self, Encoding, Imported, PROJECT_EXTENSION, Project, RenderRequest, Rendered};
 use crate::settings::Settings;
+use crate::timebar;
 use crate::timeline::{Event, Strip, TimelineView};
 use crate::tr;
 use eframe::egui::{self, Align, Key, Layout, Modifiers, RichText, Sense, Vec2};
@@ -75,6 +77,10 @@ pub struct App {
     preview: Option<Preview>,
     /// the unedited source, for comparing
     original: Option<Preview>,
+    /// the clips' sound, if they have any
+    audio: Option<Audio>,
+    /// sound is played (not in tests)
+    sound: bool,
     thumbs: Vec<Option<egui::TextureHandle>>,
     thumb_feed: Option<Feed<(usize, Vec<u8>)>>,
     timeline: TimelineView,
@@ -107,6 +113,8 @@ impl App {
             project: None,
             preview: None,
             original: None,
+            audio: None,
+            sound: true,
             thumbs: Vec::new(),
             thumb_feed: None,
             timeline: TimelineView::default(),
@@ -289,11 +297,16 @@ impl App {
         let (Some(p), Some(preview)) = (&self.project, &self.preview) else { return };
         let stem = Path::new(&p.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let ext = settings.extension();
-        let filter = if ext == "264" { tr!("filter-raw") } else { tr!("filter-mp4") };
+        let filter = match settings.container {
+            Container::Mp4 => tr!("filter-mp4"),
+            Container::Mkv => tr!("filter-mkv"),
+            Container::Raw => tr!("filter-raw"),
+        };
         let dialog = rfd::FileDialog::new().set_parent(frame).add_filter(filter, &[ext]).set_file_name(format!("{stem}-mosh.{ext}"));
         let Some(path) = dialog.save_file() else { return };
         let (tools, rendered, fps, out) = (self.tools.clone(), preview.rendered().clone(), p.fps.clone(), path.clone());
-        let job = Job::spawn(ctx, move |r| project::export(&tools, &rendered, &fps, &out, &settings, r));
+        let clips = p.clips().filter(|_| p.has_tracks());
+        let job = Job::spawn(ctx, move |r| project::export(&tools, &rendered, &fps, &out, &settings, clips.as_deref(), r));
         self.job = Some(Running::Export(job, path));
     }
 
@@ -334,6 +347,10 @@ impl App {
         self.thumbs = vec![None; project.source.len()];
         self.preview = Some(Preview::new(self.tools.clone(), rendered, project.preview_size(), PREVIEW_CACHE));
         self.original = Some(Preview::new(self.tools.clone(), project.original.clone(), project.preview_size(), ORIGINAL_CACHE));
+        self.audio = match project.clips() {
+            Some(clips) if self.sound && project.has_tracks() => Audio::new(self.tools.clone(), clips, project.fps.clone()),
+            _ => None,
+        };
         if let Some(file) = &project.file {
             self.settings.add_recent(file);
         }
@@ -415,8 +432,14 @@ impl App {
         if ids.is_empty() {
             self.info(tr!("no-keyframes"));
         } else {
-            self.edit(ctx, None, |c| c.set_deleted(&ids, true));
+            self.delete(ctx, &ids);
         }
+    }
+
+    /// Delete cards, keeping the length if the settings say so.
+    fn delete(&mut self, ctx: &egui::Context, ids: &HashSet<CardId>) {
+        let keep_length = self.settings.delete_keeps_length;
+        self.edit(ctx, None, |c| c.delete(ids, keep_length));
     }
 
     fn timeline_event(&mut self, ctx: &egui::Context, event: Event) {
@@ -430,7 +453,7 @@ impl App {
                 c.move_to(&ids, before);
             }),
             Event::Copies { ids, delta, gesture } => self.edit(ctx, Some(gesture), |c| c.add_copies(&ids, delta)),
-            Event::Restore(id) => self.edit(ctx, None, |c| c.set_deleted(&HashSet::from([id]), false)),
+            Event::Restore(id) => self.edit(ctx, None, |c| c.undelete(&HashSet::from([id]))),
             Event::SelectEffect(id) => self.active_effect = id,
             Event::EffectSpan { id, cards, on } => self.edit(ctx, None, |c| c.apply_effect(id, &cards, on)),
         }
@@ -481,25 +504,45 @@ impl App {
         }
     }
 
-    /// Move the playhead along while playing. Waits when decoding falls behind.
+    /// Move the playhead along while playing. Waits when decoding falls behind, and the
+    /// sound with it; it plays at normal speed forwards only.
     fn tick(&mut self, ctx: &egui::Context) {
-        let (Some(pb), Some(preview), Some(p)) = (&mut self.playback, &self.preview, &self.project) else { return };
+        let (Some(pb), Some(preview), Some(p)) = (&mut self.playback, &self.preview, &self.project) else {
+            if let Some(audio) = &self.audio {
+                audio.follow(false, 0.0);
+            }
+            return;
+        };
         let fps = h264mosh::pipeline::fps_value(&p.fps).unwrap_or(25.0);
         let now = ctx.input(|i| i.time);
         let last = preview.rendered().len().saturating_sub(1) as f64;
         let target = pb.from + (now - pb.since) * fps * pb.speed;
+        let waiting = !preview.shows(self.playhead);
         if target.round() as i64 != self.playhead as i64 {
-            if preview.shows(self.playhead) {
-                self.playhead = target.clamp(0.0, last).round() as usize;
-            } else {
+            if waiting {
                 (pb.from, pb.since) = (self.playhead as f64, now);
+            } else {
+                self.playhead = target.clamp(0.0, last).round() as usize;
             }
+        }
+        if let Some(audio) = &self.audio {
+            let clock = pb.from + (now - pb.since) * fps * pb.speed;
+            audio.follow(pb.speed == 1.0 && !waiting && !self.settings.mute, clock / fps);
         }
         if !(0.0..=last).contains(&target) {
             self.playback = None;
         }
         self.reveal_playhead();
         ctx.request_repaint();
+    }
+
+    /// Show output frame `k`; playing goes on from there.
+    fn seek(&mut self, ctx: &egui::Context, k: usize) {
+        self.playhead = k;
+        if let Some(speed) = self.playback.as_ref().map(|p| p.speed) {
+            self.play(ctx, speed);
+        }
+        self.reveal_playhead();
     }
 
     fn step(&mut self, delta: i64) {
@@ -564,7 +607,7 @@ impl App {
         }
         let sel = self.selection();
         if (once(Key::Delete, false) || once(Key::Backspace, false)) && !sel.is_empty() {
-            self.edit(ctx, None, |c| c.set_deleted(&sel, true));
+            self.delete(ctx, &sel);
         }
         if once(Key::Escape, false) {
             self.timeline.selection.clear();
@@ -638,9 +681,6 @@ impl App {
                 if ui.add_enabled(has, egui::Button::new(tr!("menu-save")).shortcut_text(shortcut(&ctx, "S"))).clicked() {
                     self.save(frame);
                 }
-                if ui.add_enabled(has, egui::Button::new(tr!("menu-save-as")).shortcut_text(shortcut(&ctx, "Shift+S"))).clicked() {
-                    self.save_as(frame);
-                }
                 ui.separator();
                 if ui.add_enabled(has, egui::Button::new(tr!("menu-export")).shortcut_text(shortcut(&ctx, "E"))).clicked() {
                     self.open_export();
@@ -657,6 +697,11 @@ impl App {
                 ui.separator();
                 if ui.add_enabled(self.project.is_some(), egui::Button::new(tr!("menu-drop-keyframes")).shortcut_text("D")).clicked() {
                     self.drop_keyframes(&ctx);
+                }
+                let s = &mut self.settings;
+                let keep = ui.checkbox(&mut s.delete_keeps_length, tr!("menu-delete-keeps-length"));
+                if keep.on_hover_text(tr!("menu-delete-keeps-length-tooltip")).changed() {
+                    s.save();
                 }
             });
             ui.menu_button(tr!("menu-help"), |ui| {
@@ -775,7 +820,8 @@ impl App {
             });
         });
         match edit {
-            Some((Some(deleted), _)) => self.edit(&ctx, None, |c| c.set_deleted(&sel, deleted)),
+            Some((Some(true), _)) => self.delete(&ctx, &sel),
+            Some((Some(false), _)) => self.edit(&ctx, None, |c| c.undelete(&sel)),
             Some((None, copies)) => self.edit(&ctx, None, |c| c.add_copies(&sel, copies)),
             None => {}
         }
@@ -794,6 +840,7 @@ impl App {
             playhead: self.playhead_card(),
             active_effect: self.active_effect,
             bloom: ctx.input(|i| i.key_down(Key::B)) && !ctx.egui_wants_keyboard_input(),
+            fps: pipeline::fps_value(&p.fps).unwrap_or(25.0),
         };
         for event in self.timeline.show(ui, strip) {
             self.timeline_event(&ctx, event);
@@ -830,8 +877,10 @@ impl App {
             });
             return;
         };
-        let total = preview.rendered().len();
-        let source = preview.rendered().report.frames.get(self.playhead).map(|f| f.src);
+        let rendered = preview.rendered().clone();
+        let total = rendered.len();
+        let source = rendered.report.frames.get(self.playhead).map(|f| f.src);
+        let fps = self.project.as_ref().and_then(|p| pipeline::fps_value(&p.fps)).unwrap_or(25.0);
         // the area the active effect is limited to
         let area = self.project.as_ref().and_then(|p| {
             let lane = p.cards.effects.iter().position(|e| Some(e.id) == self.active_effect)?;
@@ -839,6 +888,7 @@ impl App {
         });
         let playing = self.playback.as_ref().map(|p| p.speed);
         let mut step: Option<i64> = None;
+        let mut seek = None;
         let (mut toggle, mut hold_original) = (false, false);
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             ui.horizontal(|ui| {
@@ -868,7 +918,22 @@ impl App {
                 let original = ui.add(egui::Button::new(tr!("original-button")).sense(Sense::click_and_drag()));
                 hold_original = original.is_pointer_button_down_on();
                 original.on_hover_text(tr!("original-tooltip"));
+                if self.audio.is_some() {
+                    let mute = self.settings.mute;
+                    let button = egui::Button::new(if mute { "🔇" } else { "🔊" }).selected(!mute);
+                    if ui.add(button).on_hover_text(tr!("sound-tooltip")).clicked() {
+                        self.settings.mute = !mute;
+                        self.settings.save();
+                    }
+                }
             });
+            if let Some(p) = &self.project {
+                let source = |k: usize| {
+                    let src = rendered.report.frames[k].src;
+                    (src, p.frames[src].kind)
+                };
+                seek = timebar::show(ui, timebar::Bar { frames: total, fps, playhead: self.playhead, source: &source });
+            }
             let show_original = self.show_original || hold_original;
             let (view, k) = match (&mut self.original, source) {
                 (Some(o), Some(src)) if show_original => (o, src),
@@ -902,6 +967,9 @@ impl App {
         }
         if toggle {
             self.toggle_play(ui.ctx());
+        }
+        if let Some(k) = seek {
+            self.seek(ui.ctx(), k);
         }
         if let Some(s) = step {
             self.step(s);
@@ -963,6 +1031,7 @@ impl App {
                     ("Z", tr!("menu-undo")),
                     ("Shift+Z", tr!("menu-redo")),
                     ("S", tr!("menu-save")),
+                    ("Shift+S", tr!("shortcut-save-as")),
                     ("O", tr!("menu-open")),
                     ("E", tr!("menu-export")),
                 ] {
@@ -1028,6 +1097,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
+        if let Some(e) = self.audio.as_ref().and_then(Audio::take_error) {
+            self.info(tr!("sound-failed", reason = e));
+        }
         if let Some(feed) = &self.thumb_feed {
             for (i, pixels) in feed.drain() {
                 if let (Some(slot), Some(p)) = (self.thumbs.get_mut(i), &self.project) {
@@ -1078,7 +1150,8 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.preview_area(ui));
 
         if let Some(mut settings) = self.export_dialog {
-            let answer = export::dialog(&ctx, &mut settings);
+            let tracks = self.project.as_ref().is_some_and(Project::has_tracks);
+            let answer = export::dialog(&ctx, &mut settings, tracks);
             self.export_dialog = Some(settings);
             if let Some(go) = answer {
                 self.export_dialog = None;
@@ -1099,7 +1172,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export::{ExportFormat, Quality};
+    use crate::export::{Quality, VideoCoding};
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     use h264mosh::effects::{Mask, MbEffect};
@@ -1150,6 +1223,7 @@ mod tests {
         let builder = if gpu { builder.wgpu() } else { builder };
         let mut h = builder.build_eframe(|cc| App::new(cc));
         h.state_mut().settings = Settings::in_memory();
+        h.state_mut().sound = false;
         h.state_mut().cache_dir = test_dir().join("cache");
         h
     }
@@ -1208,7 +1282,7 @@ mod tests {
         let mut h = harness(false);
         open(&mut h, clip.clone());
         assert_eq!(project(&h).cards.len(), 75);
-        cards(&mut h).set_deleted(&(30..35).collect(), true);
+        cards(&mut h).delete(&(30..35).collect(), false);
         cards(&mut h).add_copies(&HashSet::from([40]), 2);
         cards(&mut h).move_to(&HashSet::from([60]), 10);
         assert_eq!(project(&h).cards.pending_count(), 7);
@@ -1219,22 +1293,19 @@ mod tests {
         assert_eq!(out.report.frames[10].src, 60);
 
         // every export format
-        let formats =
-            [("export.264", ExportFormat::Raw), ("export-copy.mp4", ExportFormat::Copy), ("export-baked.mp4", ExportFormat::Baked)];
-        for (name, format) in formats {
+        let formats = [
+            ("export.264", Container::Raw, VideoCoding::Moshed),
+            ("export-copy.mp4", Container::Mp4, VideoCoding::Moshed),
+            ("export-baked.mp4", Container::Mp4, VideoCoding::Baked),
+            ("export-copy.mkv", Container::Mkv, VideoCoding::Moshed),
+            ("export-baked.mkv", Container::Mkv, VideoCoding::Baked),
+        ];
+        for (name, container, video) in formats {
             let path = clip.with_file_name(name);
-            let settings = ExportSettings { format, quality: Quality::Small };
-            let (tools, input, file) = (Tools::find(None), out.clone(), path.clone());
-            let job = Job::spawn(&h.ctx, move |r| project::export(&tools, &input, "25", &file, &settings, r));
-            let result = loop {
-                match job.poll() {
-                    Some(r) => break r,
-                    None => std::thread::sleep(Duration::from_millis(10)),
-                }
-            };
-            result.unwrap();
+            let settings = ExportSettings { container, video, quality: Quality::Small, keep_tracks: true };
+            export(&h, &out, &settings, None, &path);
             let data = h264mosh::pipeline::load_annexb(&Tools::find(None), &path).unwrap();
-            if format == ExportFormat::Raw {
+            if container == Container::Raw {
                 assert!(data == out.bytes);
             }
             let frames = h264mosh::mosh::Source::new(h264mosh::stream::Stream::parse(&data).unwrap()).len();
@@ -1242,10 +1313,121 @@ mod tests {
         }
 
         // the output has to start with a keyframe
-        cards(&mut h).set_deleted(&HashSet::from([0]), true);
+        cards(&mut h).delete(&HashSet::from([0]), false);
         render(&mut h);
         assert!(h.state().notice.as_ref().is_some_and(|n| n.error));
         assert_eq!(rendered(&h).len(), 72);
+    }
+
+    /// Export `rendered` to `path` and wait for it.
+    fn export(h: &Harness<App>, rendered: &Arc<Rendered>, settings: &ExportSettings, clips: Option<Vec<(PathBuf, usize)>>, path: &Path) {
+        let (tools, input, file, settings) = (Tools::find(None), rendered.clone(), path.to_path_buf(), *settings);
+        let job = Job::spawn(&h.ctx, move |r| project::export(&tools, &input, "25", &file, &settings, clips.as_deref(), r));
+        let result = loop {
+            match job.poll() {
+                Some(r) => break r,
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        result.unwrap();
+    }
+
+    /// (type, duration) of each stream of a file, by ffprobe.
+    fn tracks(path: &Path) -> Vec<(String, f64)> {
+        let out = Command::new(Tools::find(None).ffprobe)
+            .args(["-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (kind, duration) = l.split_once(',')?;
+                Some((kind.to_string(), duration.trim().parse().unwrap_or(0.0)))
+            })
+            .collect()
+    }
+
+    /// A clip with a sine tone (or silence) of `secs` seconds, for its audio track.
+    fn clip_with_audio(name: &str, secs: u32) -> PathBuf {
+        let path = test_dir().join(name);
+        let status = Command::new(Tools::find(None).ffmpeg)
+            .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100"])
+            .args(["-t", &secs.to_string(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        path
+    }
+
+    /// The clips' audio goes along with exports into MP4 and MKV; from several clips,
+    /// joined, each as long as its frames.
+    #[test]
+    fn exports_keep_the_clips_audio() {
+        if test_clip("audio-check.264", 1, "64x64").is_none() {
+            return;
+        }
+        let tone = clip_with_audio("tone.mp4", 2);
+        let silent = test_clip("silent.mp4", 1, "320x180").unwrap();
+        let mut h = harness(false);
+        open(&mut h, tone.clone());
+        assert_eq!(project(&h).clip_frames, [50]);
+        assert!(project(&h).has_tracks());
+        // keeping the length keeps the sound in step
+        cards(&mut h).delete(&(10..20).collect(), true);
+        render(&mut h);
+        let out = rendered(&h);
+        assert_eq!(out.len(), 50);
+        for (name, container, video) in
+            [("tone-baked.mp4", Container::Mp4, VideoCoding::Baked), ("tone-copy.mkv", Container::Mkv, VideoCoding::Moshed)]
+        {
+            let path = tone.with_file_name(name);
+            let settings = ExportSettings { container, video, quality: Quality::Small, keep_tracks: true };
+            export(&h, &out, &settings, project(&h).clips(), &path);
+            let kinds: Vec<String> = tracks(&path).into_iter().map(|(k, _)| k).collect();
+            assert_eq!(kinds, ["video", "audio"], "{name}");
+            let without = ExportSettings { keep_tracks: false, ..settings };
+            export(&h, &out, &without, project(&h).clips(), &path);
+            assert_eq!(tracks(&path).len(), 1, "{name} without tracks");
+        }
+
+        // an MP4 takes text subtitles as mov_text, and audio it cannot hold as AAC
+        let srt = test_dir().join("subs.srt");
+        std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,000\nmosh\n").unwrap();
+        let mkv = test_dir().join("subs.mkv");
+        let status = Command::new(Tools::find(None).ffmpeg)
+            .args(["-v", "error", "-nostdin", "-y", "-i"])
+            .arg(&tone)
+            .arg("-i")
+            .arg(&srt)
+            .args(["-map", "0", "-map", "1", "-c:v", "copy", "-c:a", "pcm_s16le", "-c:s", "srt"])
+            .arg(&mkv)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        open(&mut h, mkv.clone());
+        let path = mkv.with_file_name("subs-out.mp4");
+        let settings = ExportSettings { container: Container::Mp4, video: VideoCoding::Moshed, quality: Quality::Small, keep_tracks: true };
+        export(&h, &rendered(&h), &settings, project(&h).clips(), &path);
+        let kinds: Vec<String> = tracks(&path).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kinds, ["video", "audio", "subtitle"]);
+
+        // two clips, the second without audio: the tone, then silence
+        open_all(&mut h, vec![tone.clone(), silent]);
+        assert_eq!(project(&h).clip_frames, [50, 25]);
+        let out = rendered(&h);
+        let path = tone.with_file_name("joined.mp4");
+        let settings = ExportSettings { container: Container::Mp4, video: VideoCoding::Moshed, quality: Quality::Small, keep_tracks: true };
+        export(&h, &out, &settings, project(&h).clips(), &path);
+        let audio = tracks(&path).into_iter().find(|(k, _)| k == "audio").expect("an audio track").1;
+        assert!((audio - 3.0).abs() < 0.1, "{audio} s");
+        // the sound played with the preview is the same join
+        let samples = h264mosh::pipeline::decode_audio(&Tools::find(None), &project(&h).clips().unwrap(), "25", 8000).unwrap();
+        assert_eq!(samples.len(), 3 * 8000 * 2);
+        let loud = |s: &[i16]| s.iter().any(|&x| x.unsigned_abs() > 1000);
+        assert!(loud(&samples[..2 * 8000 * 2]) && !loud(&samples[2 * 8000 * 2..]), "the tone, then silence");
     }
 
     fn mouse(h: &mut Harness<App>, pos: egui::Pos2, pressed: bool, modifiers: Modifiers) {
@@ -1393,6 +1575,10 @@ mod tests {
         key(&mut h, Key::D, Modifiers::NONE);
         let dropped: Vec<usize> = project(&h).cards.cards.iter().filter(|c| c.deleted).map(|c| c.src).collect();
         assert_eq!(dropped, [25]);
+        // keeping the length, the frame after it is shown twice
+        render(&mut h);
+        assert_eq!(rendered(&h).len(), 50);
+        assert_eq!(project(&h).cards.cards.iter().find(|c| c.src == 26).unwrap().copies, 2);
         h.state_mut().timeline.selection = HashSet::from([3]);
         key(&mut h, Key::B, Modifiers::NONE);
         assert_eq!(project(&h).cards.cards[3].copies, 2);
@@ -1587,7 +1773,7 @@ mod tests {
         let mut h = harness(false);
         open(&mut h, clip);
         assert!(project(&h).encoding.is_some(), "an mp4 is encoded for moshing");
-        cards(&mut h).set_deleted(&HashSet::from([25]), true);
+        cards(&mut h).delete(&HashSet::from([25]), true);
         let fx = cards(&mut h).add_effect(MbEffect::MvJitter(12), &(30..40).collect());
         render(&mut h);
         cards(&mut h).add_copies(&HashSet::from([44]), 3);
@@ -1688,7 +1874,7 @@ mod tests {
         wait(&mut h, |a| a.thumbs.iter().all(Option::is_some));
         shot(&mut h, "2_opened");
 
-        cards(&mut h).set_deleted(&(3..5).collect(), true);
+        cards(&mut h).delete(&(3..5).collect(), true);
         cards(&mut h).add_copies(&HashSet::from([6]), 2);
         cards(&mut h).move_to(&HashSet::from([1]), 9);
         h.state_mut().timeline.selection = (8..14).collect();
@@ -1735,5 +1921,13 @@ mod tests {
 
         h.state_mut().timeline.zoom = 6.0;
         shot(&mut h, "6_zoomed_out");
+        h.state_mut().timeline.zoom = 0.0;
+        shot(&mut h, "6b_whole");
+        h.state_mut().timeline.zoom = 60.0;
+        h.run_steps(2);
+        let pos = card(&h, 6).center();
+        h.hover_at(pos);
+        h.run_steps(30);
+        shot(&mut h, "6c_card_tooltip");
     }
 }
