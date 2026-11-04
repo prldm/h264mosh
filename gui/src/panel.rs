@@ -33,8 +33,8 @@ pub struct Context<'a> {
     pub display: &'a [usize],
     pub selection: &'a HashSet<CardId>,
     pub active: Option<EffectId>,
-    /// CAVLC entropy coding (macroblock effects need it)
-    pub cavlc: bool,
+    /// the stream's macroblocks can be edited (macroblock effects need it)
+    pub macroblocks: bool,
     /// reference frames of the stream
     pub refs: u32,
 }
@@ -191,11 +191,11 @@ pub fn show(ui: &mut egui::Ui, cards: &Cards, c: &Context) -> Vec<Action> {
             for (group, kinds) in groups() {
                 ui.menu_button(group, |ui| {
                     for kind in kinds {
-                        let usable = c.cavlc || !kind.needs_macroblocks();
+                        let usable = c.macroblocks || !kind.needs_macroblocks();
                         let button = ui
                             .add_enabled(usable, egui::Button::new(effect_name(&kind)))
                             .on_hover_text(effect_about(&kind))
-                            .on_disabled_hover_text(tr!("effects-need-cavlc"));
+                            .on_disabled_hover_text(tr!("effects-need-macroblocks"));
                         if button.clicked() {
                             actions.push(Action::Add(kind));
                             ui.close();
@@ -207,8 +207,8 @@ pub fn show(ui: &mut egui::Ui, cards: &Cards, c: &Context) -> Vec<Action> {
         .response
         .on_disabled_hover_text(tr!("effects-select-first"));
     });
-    if !c.cavlc {
-        ui.label(RichText::new(tr!("effects-need-cavlc")).color(ui.visuals().warn_fg_color).small());
+    if !c.macroblocks {
+        ui.label(RichText::new(tr!("effects-need-macroblocks")).color(ui.visuals().warn_fg_color).small());
     }
 
     // lanes, applied from top to bottom

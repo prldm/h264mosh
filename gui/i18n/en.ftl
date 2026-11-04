@@ -134,7 +134,7 @@ card-tooltip-removed = Deleted here: { $frames }
 
 effects-title = Effects
 effects-none = No effects yet. Select frames and add one.
-effects-need-cavlc = Most effects need a CAVLC stream: open the clips from video files (they are re-encoded so) instead of a raw stream. The picture effects work on any stream.
+effects-need-macroblocks = Most effects cannot edit the macroblocks of this stream (interlaced MBAFF, slice groups or SP/SI slices): open the clips from video files (they are re-encoded) instead of a raw stream. The picture effects work on any stream.
 effects-select-first = Select the frames first.
 effect-add = Add effect
 effect-label = { $name } { $summary }

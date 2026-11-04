@@ -797,7 +797,7 @@ impl App {
             display: &p.source.display,
             selection: &self.timeline.selection,
             active: self.active_effect,
-            cavlc: p.cavlc,
+            macroblocks: p.macroblocks,
             refs: p.refs,
         };
         let actions = panel::show(ui, &p.cards, &context);
@@ -1312,7 +1312,7 @@ mod tests {
         let Some(clip) = test_clip("fx.264", 2, "320x180") else { return };
         let mut h = harness(false);
         open(&mut h, clip);
-        assert!(project(&h).cavlc);
+        assert!(project(&h).macroblocks);
         h.state_mut().timeline.zoom = 40.0;
         h.state_mut().timeline.selection = (5..10).collect();
         let ctx = h.ctx.clone();
@@ -1353,8 +1353,8 @@ mod tests {
         assert_eq!(project(&h).cards.cards[3].copies, 2);
     }
 
-    /// New effects from the panel, one limited to an area; picture effects on a CABAC
-    /// stream; clips imported with several reference frames.
+    /// New effects from the panel, one limited to an area; macroblock and picture effects
+    /// on a CABAC stream; clips imported with several reference frames.
     #[test]
     fn effects_with_areas_and_picture_effects() {
         let Some(clip) = test_clip("areas.264", 2, "320x180") else { return };
@@ -1387,7 +1387,7 @@ mod tests {
         key(&mut h, Key::Z, Modifiers::COMMAND);
         assert_eq!(project(&h).cards.effect(lanes[0]).unwrap().mask, None);
 
-        // a CABAC stream takes the picture effects
+        // a CABAC stream takes macroblock and picture effects
         let cabac = test_dir().join("cabac.264");
         let status = Command::new(Tools::find(None).ffmpeg)
             .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-t", "2"])
@@ -1398,9 +1398,11 @@ mod tests {
         assert!(status.success());
         let mut g = harness(false);
         open(&mut g, cabac);
-        assert!(!project(&g).cavlc);
+        assert!(project(&g).macroblocks);
         g.state_mut().timeline.selection = (10..20).collect();
         let ctx = g.ctx.clone();
+        g.state_mut().panel_action(&ctx, Action::Add(MbEffect::MvScale(2.0, 1.0)));
+        g.state_mut().panel_action(&ctx, Action::Add(MbEffect::IntraMode(1)));
         g.state_mut().panel_action(&ctx, Action::Add(MbEffect::Tint(6, -6)));
         g.state_mut().panel_action(&ctx, Action::Add(MbEffect::Deblock(-6, -6)));
         render(&mut g);

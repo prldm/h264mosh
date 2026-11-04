@@ -6,6 +6,7 @@ use crate::export::{ExportFormat, ExportSettings};
 use crate::history::History;
 use crate::jobs::{Reporter, Stage};
 use anyhow::{Context, Result, bail};
+use h264mosh::mb::MbContext;
 use h264mosh::mosh::{self, RenderOptions, RenderReport, Source, Timeline};
 use h264mosh::pipeline::{self, BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools};
 use h264mosh::stream::{NalKind, Stream};
@@ -91,8 +92,9 @@ pub struct Project {
     /// picture size
     pub size: (u32, u32),
     pub fps: String,
-    /// CAVLC entropy coding (macroblock effects need it)
-    pub cavlc: bool,
+    /// the macroblock layer can be edited (macroblock effects need it): not with MBAFF,
+    /// slice groups or SP/SI slices
+    pub macroblocks: bool,
     /// reference frames of the stream (max_num_ref_frames)
     pub refs: u32,
     pub cards: Cards,
@@ -256,7 +258,7 @@ fn load(
         _ => None,
     });
     let Some(sps) = sps else { bail!("{name}: no H.264 sequence parameter set found") };
-    let cavlc = stream.nals.iter().all(|n| !matches!(&n.kind, NalKind::Pps(p) if p.entropy_coding_mode_flag));
+    let macroblocks = stream.nals.iter().filter_map(|n| n.slice()).all(|s| MbContext::new(s).is_ok());
     let source = Source::new(stream);
     if source.is_empty() {
         bail!("{name}: no frames found");
@@ -279,7 +281,7 @@ fn load(
         frames,
         size: sps.size(),
         fps,
-        cavlc,
+        macroblocks,
         refs: sps.max_num_ref_frames,
         cards,
         history: History::default(),
