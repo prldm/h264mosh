@@ -476,14 +476,14 @@ fn apply_to_data(
                     for b in new.coeffs.iter_mut() {
                         scale_band(b, mb.mb_type, mb.transform_8x8, from, factor);
                     }
-                    fit_levels(mb, new, scaling);
+                    fit_levels(ctx, mb, new, scaling);
                 }
             }
             MbEffect::DcShift(y, cb, cr) => {
                 let scaling = scaling.get_or_insert_with(|| Scaling::new(ctx));
                 for (_, mb) in data.mbs.iter_mut().enumerate().filter(|(i, m)| inside(fx, *i) && m.mb_type != MbType::Skip) {
                     if let Some(new) = dc_shifted(mb, [y, cb, cr], ctx.chroma_array_type) {
-                        fit_levels(mb, new, scaling);
+                        fit_levels(ctx, mb, new, scaling);
                     }
                 }
             }
@@ -605,7 +605,8 @@ fn apply_to_data(
 /// Uncoded macroblocks take the QP of the macroblock before them. Where effects inside
 /// a mask changed that, an untouched macroblock outside gets its QP back by carrying
 /// mb_qp_delta with an all-zero residual, which changes neither its picture nor its
-/// deblocking.
+/// deblocking (an I_8x8 macroblock carries it with an empty chroma DC, see
+/// [`mb::without_empty_8x8`]).
 fn keep_quantizers(ctx: &MbContext, data: &mut SliceData, slice_qp: i32, qps: &[i32], untouched: &[bool]) -> Result<()> {
     let mut pred = slice_qp;
     let mut skips = Vec::new();
@@ -628,6 +629,7 @@ fn keep_quantizers(ctx: &MbContext, data: &mut SliceData, slice_qp: i32, qps: &[
             skips.push(i);
         }
         mb.cbp = 1;
+        (mb.cbp, mb.transform_8x8) = mb::without_empty_8x8(ctx, mb);
         mb.qp = qps[i];
         pred = qps[i];
     }
@@ -678,8 +680,10 @@ fn fit_qp(mb: &mut Macroblock, want: i32, scaling: &Scaling) {
 
 /// Replace the levels of `mb` by those of `new` (same macroblock, more coded blocks
 /// allowed), or, if they do not fit the value ranges, by the largest step from the old
-/// levels towards them that does.
-fn fit_levels(mb: &mut Macroblock, new: Macroblock, scaling: &Scaling) {
+/// levels towards them that does. 8x8 blocks left empty are coded otherwise
+/// ([`mb::without_empty_8x8`]: the same with CAVLC and CABAC, deblocked alike by all
+/// decoders).
+fn fit_levels(ctx: &MbContext, mb: &mut Macroblock, new: Macroblock, scaling: &Scaling) {
     let blend = |t: f32| {
         let mut m = new.clone();
         for b in m.coeffs.iter_mut() {
@@ -704,6 +708,7 @@ fn fit_levels(mb: &mut Macroblock, new: Macroblock, scaling: &Scaling) {
         best = blend(lo);
     }
     *mb = best;
+    (mb.cbp, mb.transform_8x8) = mb::without_empty_8x8(ctx, mb);
 }
 
 /// Multiply the levels of a block from scan position `from` (a fraction of the scan

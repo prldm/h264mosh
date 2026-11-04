@@ -25,5 +25,7 @@ run ref2 mosh "$M/x264_cavlc_ref2.264" -o "$OUT/ref2.264" --mv-add 3:1 --explici
 run i444 mosh "$M/x264_cavlc_i444.264" -o "$OUT/i444.264" --mv-scale 0.5 --zero-residual
 run i422 mosh "$M/x264_cavlc_i422.264" -o "$OUT/i422.264" --split-8x8 --kill-intra
 run bit10 mosh "$M/x264_cavlc_bit10.264" -o "$OUT/bit10.264" --mv-scale -1 --zero-residual
+run coeffs mosh "$S1080" -o "$OUT/coeffs.264" --coeff-scale 0:0.25
+run coeffs_cabac mosh "$M/x264_default.264" -o "$OUT/coeffs_cabac.264" --coeff-scale 0:0.25 --qp-add 6
 "$BIN" info "$S1080" --mbs >"$OUT/info_mbs.txt"
 "$BIN" roundtrip "$S720" --mb >"$OUT/roundtrip.txt"

@@ -21,7 +21,7 @@ pub mod tables;
 
 use crate::bits::{BitReader, BitWriter};
 use crate::mb::{
-    self, Blk, CoeffBlock, LUMA4X4_XY, Macroblock, MbContext, MbType, Mvd, Pred, RowCache, Shape, SliceData, sub_mb_info, to_mvd, uses_list,
+    self, Blk, CoeffBlock, LUMA4X4_XY, Macroblock, MbContext, MbType, Mvd, RowCache, Shape, SliceData, sub_mb_info, to_mvd, uses_list,
 };
 use crate::slice::{Slice, SliceType};
 use anyhow::{Result, bail};
@@ -456,18 +456,10 @@ impl<'a, E: Engine> Coder<'a, E> {
             self.nbs.set(addr, self.cur);
             return Ok(());
         }
-        let t8_mode = mb::transform_8x8_mode(ctx);
-        let mut no_sub_lt8 = true;
         if mb_type.num_parts() == 4 {
             self.sub_mb_pred(m)?;
-            for i in 0..4 {
-                let (n, pred, _, _) = sub_mb_info(st, m.sub_types[i]);
-                if (pred == Pred::Direct && !ctx.sps.direct_8x8_inference_flag) || (pred != Pred::Direct && n > 1) {
-                    no_sub_lt8 = false;
-                }
-            }
         } else {
-            if t8_mode && mb_type == MbType::INxN {
+            if mb::transform_8x8_mode(ctx) && mb_type == MbType::INxN {
                 m.transform_8x8 = self.transform_8x8(m.transform_8x8);
             } else if mb_type == MbType::INxN {
                 m.transform_8x8 = false;
@@ -478,31 +470,12 @@ impl<'a, E: Engine> Coder<'a, E> {
             m.cbp = intra_cbp;
             m.transform_8x8 = false;
         } else {
-            let t8_allowed =
-                t8_mode && mb_type != MbType::INxN && no_sub_lt8 && (mb_type != MbType::B(0) || ctx.sps.direct_8x8_inference_flag);
-            if let Some(src) = src.filter(|_| ctx.chroma_array_type != 3)
-                && m.transform_8x8
-                && (mb_type == MbType::INxN || t8_allowed)
-            {
-                // An 8x8 block without coefficients cannot be coded under its
-                // CodedBlockPatternLuma bit. Keep the picture and the QP: without any luma
-                // coefficients an inter macroblock can take the 4x4 transform instead;
-                // otherwise the empty blocks go, and an empty chroma DC keeps mb_qp_delta.
-                let empty = (0..4)
-                    .filter(|&b8| (0..4).all(|j| levels_of(&src.coeffs, Blk::Luma(0, 4 * b8 + j)).iter().all(|&l| l == 0)))
-                    .fold(0, |e, b8| e | 1 << b8)
-                    & m.cbp;
-                if empty != 0 && mb_type != MbType::INxN && empty == m.cbp & 15 {
-                    m.transform_8x8 = false;
-                } else if empty != 0 {
-                    m.cbp &= !empty;
-                    if m.cbp == 0 && ctx.chroma_array_type != 0 {
-                        m.cbp = 0x10;
-                    }
-                }
+            // `src` has the coefficients; while the 8x8 transform is on, its header is `m`'s
+            if let Some(src) = src.filter(|_| m.transform_8x8) {
+                (m.cbp, m.transform_8x8) = mb::without_empty_8x8(ctx, src);
             }
             m.cbp = self.coded_block_pattern(m.cbp)?;
-            if m.cbp & 15 != 0 && t8_allowed {
+            if m.cbp & 15 != 0 && mb::inter_transform_8x8(ctx, m) {
                 m.transform_8x8 = self.transform_8x8(m.transform_8x8);
             } else if mb_type != MbType::INxN {
                 m.transform_8x8 = false;

@@ -2,7 +2,7 @@
 //! tests are skipped (with a message) when ffmpeg is not available.
 
 use h264mosh::effects::{Fx, Mask, MbEffect};
-use h264mosh::mb::MbContext;
+use h264mosh::mb::{Blk, MbContext};
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
 use h264mosh::pipeline::{BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
 use h264mosh::pps::Pps;
@@ -1170,15 +1170,26 @@ fn to_cavlc(data: &[u8]) -> Vec<u8> {
     stream.write(false).unwrap()
 }
 
+/// 8x8 luma blocks of inter macroblocks coded under their coded block pattern bit but
+/// without coefficients (ffmpeg's CAVLC decoder deblocks them as if they had some).
+/// 4:4:4 keeps them: CABAC codes them too, and ffmpeg deblocks them alike.
+fn empty_8x8_blocks(data: &[u8]) -> usize {
+    let stream = Stream::parse(data).unwrap();
+    let mut n = 0;
+    for s in stream.nals.iter().filter_map(|n| n.slice()).filter(|s| MbContext::new(s).unwrap().chroma_array_type != 3) {
+        for m in h264mosh::mb::parse_slice_data(s).unwrap().mbs.iter().filter(|m| m.transform_8x8 && m.mb_type.is_inter()) {
+            let empty = |b8: u8| (0..4).all(|j| m.block(Blk::Luma(0, 4 * b8 + j)).is_none());
+            n += (0..4).filter(|&b8| m.cbp & 1 << b8 != 0 && empty(b8)).count();
+        }
+    }
+    n
+}
+
 /// CABAC streams written again with CAVLC from the parsed macroblocks decode to the
 /// same pictures: an independent check of the CABAC parser. Edited CABAC streams
 /// decode like their macroblocks written with CAVLC, which checks the CABAC writer, and
-/// effects on a CABAC stream and on its CAVLC twin give the same pictures.
-///
-/// The exception are 8x8 blocks an effect empties: CABAC cannot code them, so the
-/// writer codes the macroblock differently (same coefficients, QP and motion), while
-/// CAVLC keeps them, and ffmpeg's CAVLC decoder then deblocks those blocks as if they
-/// had coefficients (bS 2, against 8.7.2.1). For Coeffs only the first two checks hold.
+/// effects on a CABAC stream and on its CAVLC twin give the same pictures (8x8 blocks
+/// an effect empties are coded the same way with both, see `without_empty_8x8`).
 #[test]
 fn cabac_macroblocks_match_cavlc() {
     if !ffmpeg_available() {
@@ -1217,10 +1228,10 @@ fn cabac_macroblocks_match_cavlc() {
             assert_bit_exact(&a);
             let (md5, _) = decode(&to_cavlc(&a), "cabac_fx_twin.264");
             assert_eq!(md5_a, md5, "{name} {fx:?}: the edited CABAC stream and its CAVLC twin differ");
-            if !matches!(fx[0], MbEffect::Coeffs(..)) {
-                let (md5, _) = decode(&with_effects(&twin, fx), "cavlc_fx.264");
-                assert_eq!(md5_a, md5, "{name} {fx:?}: the effect on CABAC and on CAVLC differs");
-            }
+            let c = with_effects(&twin, fx);
+            assert_eq!(empty_8x8_blocks(&c), 0, "{name} {fx:?}: CAVLC codes empty 8x8 blocks");
+            let (md5, _) = decode(&c, "cavlc_fx.264");
+            assert_eq!(md5_a, md5, "{name} {fx:?}: the effect on CABAC and on CAVLC differs");
         }
     }
 }

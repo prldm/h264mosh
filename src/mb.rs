@@ -489,15 +489,8 @@ fn parse_mb(r: &mut BitReader, ctx: &MbContext, nb: &mut Neighbours, addr: usize
         nb.tcs.set(addr, TotalCoeffs::filled(16));
         return Ok(mb);
     }
-    let mut no_sub_lt8 = true;
     if mb_type.num_parts() == 4 {
         parse_sub_mb_pred(r, ctx, &mut mb)?;
-        for i in 0..4 {
-            let (n, pred, _, _) = sub_mb_info(ctx.slice_type, mb.sub_types[i]);
-            if (pred == Pred::Direct && !ctx.sps.direct_8x8_inference_flag) || (pred != Pred::Direct && n > 1) {
-                no_sub_lt8 = false;
-            }
-        }
     } else {
         if transform_8x8_mode(ctx) && mb_type == MbType::INxN {
             mb.transform_8x8 = r.flag()?;
@@ -511,12 +504,7 @@ fn parse_mb(r: &mut BitReader, ctx: &MbContext, nb: &mut Neighbours, addr: usize
         let (intra, inter) = ctx.cbp_tables();
         let table = if mb_type == MbType::INxN { intra } else { inter };
         mb.cbp = *table.get(code).ok_or_else(|| anyhow::anyhow!("coded_block_pattern {code} out of range"))?;
-        if mb.cbp & 15 != 0
-            && transform_8x8_mode(ctx)
-            && mb_type != MbType::INxN
-            && no_sub_lt8
-            && (mb_type != MbType::B(0) || ctx.sps.direct_8x8_inference_flag)
-        {
+        if mb.cbp & 15 != 0 && inter_transform_8x8(ctx, &mb) {
             mb.transform_8x8 = r.flag()?;
         }
     }
@@ -539,6 +527,62 @@ fn parse_mb(r: &mut BitReader, ctx: &MbContext, nb: &mut Neighbours, addr: usize
 
 pub(crate) fn transform_8x8_mode(ctx: &MbContext) -> bool {
     ctx.pps.ext.as_ref().is_some_and(|e| e.transform_8x8_mode_flag)
+}
+
+/// Whether an inter macroblock can take the 8x8 transform (7.3.5): no partition is
+/// smaller than 8x8.
+pub(crate) fn inter_transform_8x8(ctx: &MbContext, mb: &Macroblock) -> bool {
+    let sub_8x8 = |&sub: &u8| {
+        let (n, pred, _, _) = sub_mb_info(ctx.slice_type, sub);
+        if pred == Pred::Direct { ctx.sps.direct_8x8_inference_flag } else { n <= 1 }
+    };
+    transform_8x8_mode(ctx)
+        && mb.mb_type.is_inter()
+        && match mb.mb_type.num_parts() {
+            0 => ctx.sps.direct_8x8_inference_flag,
+            4 => mb.sub_types.iter().all(sub_8x8),
+            _ => true,
+        }
+}
+
+/// The coded block pattern and transform size of `mb` with its 8x8 luma blocks that
+/// have no coefficients coded otherwise. Outside 4:4:4, CABAC cannot code such a block
+/// under its CodedBlockPatternLuma bit (its coded_block_flag is inferred to be 1), and
+/// ffmpeg's CAVLC decoder deblocks one in an inter macroblock as if it had
+/// coefficients (bS 2, against 8.7.2.1). Picture and QP stay: an inter macroblock
+/// without luma coefficients takes the 4x4 transform instead (each 8x8 partition moves
+/// as one, so no edge inside it is filtered either way); otherwise the empty blocks
+/// leave the coded block pattern, and an empty chroma DC keeps mb_qp_delta. Without
+/// chroma that is not possible: CAVLC then keeps the empty blocks, CABAC loses
+/// mb_qp_delta.
+pub(crate) fn without_empty_8x8(ctx: &MbContext, mb: &Macroblock) -> (u8, bool) {
+    let keep = (mb.cbp, mb.transform_8x8);
+    if ctx.chroma_array_type == 3 || !mb.transform_8x8 || mb.cbp & 15 == 0 {
+        return keep;
+    }
+    let takes_8x8 = if mb.mb_type == MbType::INxN { transform_8x8_mode(ctx) } else { inter_transform_8x8(ctx, mb) };
+    if !takes_8x8 {
+        return keep;
+    }
+    let coded = mb.coeffs.iter().fold(0, |c, b| match b.blk {
+        Blk::Luma(0, blk) if b.levels.iter().any(|&l| l != 0) => c | 1 << (blk / 4),
+        _ => c,
+    });
+    let empty = mb.cbp & 15 & !coded;
+    let cbp = mb.cbp & !empty;
+    if empty == 0 {
+        keep
+    } else if mb.mb_type != MbType::INxN && cbp & 15 == 0 {
+        (mb.cbp, false)
+    } else if cbp != 0 {
+        (cbp, true)
+    } else if ctx.chroma_array_type != 0 {
+        (0x10, true)
+    } else if ctx.pps.entropy_coding_mode_flag {
+        (0, true)
+    } else {
+        keep
+    }
 }
 
 fn pcm_sizes(ctx: &MbContext) -> (usize, usize) {
@@ -788,15 +832,8 @@ fn write_mb(w: &mut BitWriter, ctx: &MbContext, nb: &mut Neighbours, addr: usize
         nb.tcs.set(addr, TotalCoeffs::filled(16));
         return Ok(());
     }
-    let mut no_sub_lt8 = true;
     if mb.mb_type.num_parts() == 4 {
         write_sub_mb_pred(w, ctx, mb);
-        for i in 0..4 {
-            let (n, pred, _, _) = sub_mb_info(ctx.slice_type, mb.sub_types[i]);
-            if (pred == Pred::Direct && !ctx.sps.direct_8x8_inference_flag) || (pred != Pred::Direct && n > 1) {
-                no_sub_lt8 = false;
-            }
-        }
     } else {
         if transform_8x8_mode(ctx) && mb.mb_type == MbType::INxN {
             w.flag(mb.transform_8x8);
@@ -808,12 +845,7 @@ fn write_mb(w: &mut BitWriter, ctx: &MbContext, nb: &mut Neighbours, addr: usize
         let table = if mb.mb_type == MbType::INxN { intra } else { inter };
         let Some(code) = table.iter().position(|&c| c == mb.cbp) else { bail!("coded_block_pattern {} not codable", mb.cbp) };
         w.ue(code as u32);
-        if mb.cbp & 15 != 0
-            && transform_8x8_mode(ctx)
-            && mb.mb_type != MbType::INxN
-            && no_sub_lt8
-            && (mb.mb_type != MbType::B(0) || ctx.sps.direct_8x8_inference_flag)
-        {
+        if mb.cbp & 15 != 0 && inter_transform_8x8(ctx, mb) {
             w.flag(mb.transform_8x8);
         }
     }
