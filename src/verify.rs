@@ -200,11 +200,18 @@ pub fn mb_roundtrip(stream: &Stream) -> MbRoundtripReport {
             let (buf, start, end) = slice.slice_data();
             let problem = match result {
                 Err(e) => Some(format!("{e:#}")),
-                Ok((bytes, bits)) => {
-                    let mut orig = crate::bits::BitWriter::new();
-                    orig.append_bits(buf, start, end);
-                    let orig_bits = orig.bit_len();
-                    (bits != orig_bits || bytes != orig.into_bytes()).then(|| {
+                Ok(written) => {
+                    // both placed at the slice data's offset within a byte, so that the
+                    // I_PCM samples are aligned as in the slice
+                    let at_offset = |append: &dyn Fn(&mut crate::bits::BitWriter)| {
+                        let mut w = crate::bits::BitWriter::new();
+                        (0..start % 8).for_each(|_| w.flag(false));
+                        append(&mut w);
+                        (w.bit_len() - start % 8, w.into_bytes())
+                    };
+                    let (bits, bytes) = at_offset(&|w| written.append_to(w));
+                    let (orig_bits, orig) = at_offset(&|w| w.append_bits(buf, start, end));
+                    (bits != orig_bits || bytes != orig).then(|| {
                         let mut msg = format!("rewritten slice data differs ({bits} bits vs {orig_bits})");
                         if slice.pps.entropy_coding_mode_flag {
                             msg = format!("{msg}; {}", first_bin_difference(slice));

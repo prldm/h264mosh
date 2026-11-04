@@ -330,8 +330,7 @@ pub fn apply(slice: &mut Slice, effects: &[Fx], seed: u64, donors: &Donors) -> R
         (data, slice_qp)
     };
     slice.header.slice_qp_delta = slice_qp - 26 - slice.pps.pic_init_qp_minus26;
-    let (bytes, bits) = mb::write_slice_data(slice, &data)?;
-    slice.set_slice_data(bytes, bits)?;
+    slice.set_slice_data(mb::write_slice_data(slice, &data)?)?;
     Ok(stats)
 }
 

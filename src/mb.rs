@@ -10,7 +10,7 @@ use crate::bits::{BitReader, BitWriter};
 use crate::cavlc::{read_block, write_block};
 use crate::cavlc_tables::{CBP_INTER, CBP_INTER_GRAY, CBP_INTRA, CBP_INTRA_GRAY};
 use crate::pps::Pps;
-use crate::slice::{Slice, SliceHeader, SliceType};
+use crate::slice::{Slice, SliceDataBits, SliceHeader, SliceType};
 use crate::sps::Sps;
 use anyhow::{Result, bail};
 
@@ -612,10 +612,14 @@ pub(crate) fn read_pcm(r: &mut BitReader, ctx: &MbContext) -> Result<Vec<u16>> {
     Ok(samples)
 }
 
-pub(crate) fn write_pcm(w: &mut BitWriter, ctx: &MbContext, mb: &Macroblock) -> Result<()> {
+/// Write the pcm_alignment_zero_bits and samples of an I_PCM macroblock; returns where
+/// the alignment bits are (start, end).
+pub(crate) fn write_pcm(w: &mut BitWriter, ctx: &MbContext, mb: &Macroblock) -> Result<(usize, usize)> {
+    let start = w.bit_len();
     while !w.byte_aligned() {
         w.flag(false);
     }
+    let alignment = (start, w.bit_len());
     let (n_luma, n_chroma) = pcm_sizes(ctx);
     let Some(samples) = mb.pcm.as_ref().filter(|s| s.len() == n_luma + n_chroma) else { bail!("I_PCM macroblock without samples") };
     let bd_y = ctx.sps.bit_depth_luma_minus8 + 8;
@@ -623,7 +627,7 @@ pub(crate) fn write_pcm(w: &mut BitWriter, ctx: &MbContext, mb: &Macroblock) -> 
     for (i, &s) in samples.iter().enumerate() {
         w.u(if i < n_luma { bd_y } else { bd_c }, s as u32);
     }
-    Ok(())
+    Ok(alignment)
 }
 
 fn parse_mb_pred(r: &mut BitReader, ctx: &MbContext, mb: &mut Macroblock) -> Result<()> {
@@ -783,14 +787,14 @@ fn residual(coder: &mut Coder, ctx: &MbContext, nb: &Neighbours, addr: usize, mb
     Ok(())
 }
 
-/// Serialize slice data; returns the bytes and the length in bits. CAVLC slice data
-/// ends before the rbsp_slice_trailing_bits; CABAC slice data includes them (the
-/// rbsp_stop_one_bit ends the arithmetic code word) and any cabac_zero_words, like
-/// [`Slice::slice_data`].
-pub fn write_slice_data(slice: &Slice, data: &SliceData) -> Result<(Vec<u8>, usize)> {
+/// Serialize slice data. CAVLC slice data ends before the rbsp_slice_trailing_bits;
+/// CABAC slice data includes them (the rbsp_stop_one_bit ends the arithmetic code word)
+/// and any cabac_zero_words, like [`Slice::slice_data`].
+pub fn write_slice_data(slice: &Slice, data: &SliceData) -> Result<SliceDataBits> {
     let ctx = MbContext::new(slice)?;
     if ctx.pps.entropy_coding_mode_flag {
-        return crate::cabac::write_slice_data(slice, &ctx, data);
+        let (bytes, bits) = crate::cabac::write_slice_data(slice, &ctx, data)?;
+        return Ok(SliceDataBits { bytes, bits, pcm_alignment: Vec::new() });
     }
     if data.first_mb != ctx.header.first_mb_in_slice as usize {
         bail!("slice data does not start at first_mb_in_slice");
@@ -802,6 +806,7 @@ pub fn write_slice_data(slice: &Slice, data: &SliceData) -> Result<(Vec<u8>, usi
     let mut nb = Neighbours::new(ctx.width);
     let mut qp = ctx.slice_qp();
     let mut skips = 0u32;
+    let mut pcm_alignment = Vec::new();
     for (i, mb) in data.mbs.iter().enumerate() {
         let addr = data.first_mb + i;
         if mb.mb_type == MbType::Skip {
@@ -816,21 +821,30 @@ pub fn write_slice_data(slice: &Slice, data: &SliceData) -> Result<(Vec<u8>, usi
             w.ue(skips);
             skips = 0;
         }
-        write_mb(&mut w, &ctx, &mut nb, addr, mb, &mut qp).map_err(|e| e.context(format!("macroblock {addr}")))?;
+        let alignment = write_mb(&mut w, &ctx, &mut nb, addr, mb, &mut qp).map_err(|e| e.context(format!("macroblock {addr}")))?;
+        pcm_alignment.extend(alignment);
     }
     if skips > 0 {
         w.ue(skips);
     }
     let bits = w.bit_len();
-    Ok((w.into_bytes(), bits))
+    Ok(SliceDataBits { bytes: w.into_bytes(), bits, pcm_alignment })
 }
 
-fn write_mb(w: &mut BitWriter, ctx: &MbContext, nb: &mut Neighbours, addr: usize, mb: &Macroblock, qp: &mut i32) -> Result<()> {
+/// Write one macroblock; for I_PCM, returns where its pcm_alignment_zero_bits are.
+fn write_mb(
+    w: &mut BitWriter,
+    ctx: &MbContext,
+    nb: &mut Neighbours,
+    addr: usize,
+    mb: &Macroblock,
+    qp: &mut i32,
+) -> Result<Option<(usize, usize)>> {
     w.ue(mb_type_to_raw(ctx, mb)?);
     if mb.mb_type == MbType::IPcm {
-        write_pcm(w, ctx, mb)?;
+        let alignment = write_pcm(w, ctx, mb)?;
         nb.tcs.set(addr, TotalCoeffs::filled(16));
-        return Ok(());
+        return Ok(Some(alignment));
     }
     if mb.mb_type.num_parts() == 4 {
         write_sub_mb_pred(w, ctx, mb);
@@ -862,7 +876,7 @@ fn write_mb(w: &mut BitWriter, ctx: &MbContext, nb: &mut Neighbours, addr: usize
         residual(&mut Coder::Write(w, &mb.coeffs), ctx, nb, addr, mb, &mut tc)?;
     }
     nb.tcs.set(addr, tc);
-    Ok(())
+    Ok(None)
 }
 
 fn write_mb_pred(w: &mut BitWriter, ctx: &MbContext, mb: &Macroblock) {

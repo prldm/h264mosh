@@ -2,12 +2,12 @@
 //! tests are skipped (with a message) when ffmpeg is not available.
 
 use h264mosh::effects::{Fx, Mask, MbEffect};
-use h264mosh::mb::{Blk, MbContext};
+use h264mosh::mb::{Blk, Macroblock, MbContext, MbType};
 use h264mosh::mosh::{MoshPlan, RenderOptions, Source, Timeline, TimelineEntry, mosh, render, segment};
 use h264mosh::pipeline::{BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools, decode_rgba, prep, remux};
 use h264mosh::pps::Pps;
 use h264mosh::residual::Scaling;
-use h264mosh::slice::SliceType;
+use h264mosh::slice::{SliceDataBits, SliceType};
 use h264mosh::stream::{NalKind, Stream, group_access_units};
 use h264mosh::verify;
 use std::path::PathBuf;
@@ -411,7 +411,7 @@ fn failing_frame_effects_are_skipped() {
     // corrupt the slice data of frame 10: all zero bits are no valid Exp-Golomb code
     for n in src.aus[10].nals.iter_mut() {
         if let Some(s) = n.slice_mut() {
-            s.set_slice_data(vec![0; 8], 64).unwrap();
+            s.set_slice_data(SliceDataBits { bytes: vec![0; 8], bits: 64, ..Default::default() }).unwrap();
         }
     }
     let mut timeline = Timeline::identity(src.len());
@@ -707,11 +707,58 @@ fn decode_luma(data: &[u8], name: &str) -> Vec<Vec<u8>> {
     let out = Command::new(ffmpeg())
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(&path)
-        .args(["-pix_fmt", "gray", "-f", "rawvideo", "-"])
+        .args(["-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
         .output()
         .expect("ffmpeg");
     assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
-    out.stdout.chunks(320 * 192).map(<[u8]>::to_vec).collect()
+    // the Y plane as decoded (gray would convert it to full range)
+    out.stdout.chunks(320 * 192 * 3 / 2).map(|f| f[..320 * 192].to_vec()).collect()
+}
+
+/// I_PCM macroblocks in rewritten CAVLC slices: their pcm_alignment_zero_bits align
+/// the samples in the RBSP, whatever length the slice header has (also once an effect
+/// changes it), so the samples decode as they are and the macroblock layer reads back
+/// bit for bit.
+#[test]
+fn pcm_macroblocks_in_rewritten_slices() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let pattern = |x: usize, y: usize| ((x * 13 + y * 7) % 200 + 20) as u8;
+    let pcm_mbs = [21, 42, 43];
+    let mut stream = Stream::parse(&mosh_friendly("testsrc2", 1, &["-coder", "0"])).unwrap();
+    let mut unaligned = 0;
+    for n in stream.nals.iter_mut() {
+        let NalKind::Slice(s) = &mut n.kind else { continue };
+        unaligned += !s.header_bits().is_multiple_of(8) as usize;
+        let mut data = h264mosh::mb::parse_slice_data(s).unwrap();
+        for addr in pcm_mbs {
+            let mut mb = Macroblock::new(MbType::IPcm, data.mbs[addr].qp);
+            let luma = (0..256).map(|i| pattern(i % 16, i / 16) as u16);
+            mb.pcm = Some(luma.chain(std::iter::repeat_n(128, 128)).collect());
+            data.mbs[addr] = mb;
+        }
+        s.set_slice_data(h264mosh::mb::write_slice_data(s, &data).unwrap()).unwrap();
+        n.dirty = true;
+    }
+    assert!(unaligned > 0, "no slice header to misalign the samples");
+    let with_pcm = stream.write(false).unwrap();
+    // QpAdd changes slice_qp_delta, and with it the length of every slice header
+    for (name, data) in [("pcm.264", with_pcm.clone()), ("pcm_qp.264", with_effects(&with_pcm, &[MbEffect::QpAdd(6)]))] {
+        let luma = decode_luma(&data, name);
+        assert_eq!(luma.len(), 25, "{name}");
+        for (f, picture) in luma.iter().enumerate() {
+            for addr in pcm_mbs {
+                let (x0, y0) = (addr % 20 * 16, addr / 20 * 16);
+                // inside the edges the deblocking filter may touch
+                for (x, y) in (3..13).flat_map(|y| (3..13).map(move |x| (x, y))) {
+                    assert_eq!(picture[(y0 + y) * 320 + x0 + x], pattern(x, y), "{name}: frame {f}, macroblock {addr}");
+                }
+            }
+        }
+        let rep = verify::mb_roundtrip(&Stream::parse(&data).unwrap());
+        assert_eq!((rep.different, rep.skipped), (0, 0), "{name}: {:?}", rep.failures);
+    }
 }
 
 /// A masked effect changes the masked area and leaves the rest of the picture alone.
@@ -1160,8 +1207,7 @@ fn to_cavlc(data: &[u8]) -> Vec<u8> {
                 let data = h264mosh::mb::parse_slice_data(s).unwrap();
                 s.pps = cavlc(&s.pps);
                 s.header.cabac_init_idc = 0;
-                let (bytes, bits) = h264mosh::mb::write_slice_data(s, &data).unwrap();
-                s.set_slice_data(bytes, bits).unwrap();
+                s.set_slice_data(h264mosh::mb::write_slice_data(s, &data).unwrap()).unwrap();
             }
             _ => continue,
         }

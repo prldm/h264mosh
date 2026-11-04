@@ -494,6 +494,33 @@ fn write_dec_ref_pic_marking(w: &mut BitWriter, m: &DecRefPicMarking) {
     }
 }
 
+/// Slice data as `mb::write_slice_data` writes it, `bits` long: for CAVLC without the
+/// trailing bits, for CABAC including them and any cabac_zero_words.
+#[derive(Clone, Debug, Default)]
+pub struct SliceDataBits {
+    pub bytes: Vec<u8>,
+    pub bits: usize,
+    /// CAVLC: where each run of pcm_alignment_zero_bit is, (start, end) bit positions.
+    /// They align the I_PCM samples in `bytes`; in the slice the samples are aligned
+    /// in the RBSP, after a slice header of any length.
+    pub pcm_alignment: Vec<(usize, usize)>,
+}
+
+impl SliceDataBits {
+    /// Append to `w`, with the I_PCM samples aligned where they land in it.
+    pub fn append_to(&self, w: &mut BitWriter) {
+        let mut at = 0;
+        for &(start, end) in &self.pcm_alignment {
+            w.append_bits(&self.bytes, at, start);
+            while !w.byte_aligned() {
+                w.flag(false);
+            }
+            at = end;
+        }
+        w.append_bits(&self.bytes, at, self.bits);
+    }
+}
+
 /// A coded slice: parsed header plus the untouched original RBSP, which is shared
 /// between duplicates (cloning a Slice is cheap).
 #[derive(Clone, Debug)]
@@ -507,9 +534,8 @@ pub struct Slice {
     header_bits: usize,
     /// bit position in `rbsp` where slice_data() starts (after any cabac_alignment_one_bit)
     data_bit: usize,
-    /// replacement slice data: bytes and length in bits, like `slice_data()` (CAVLC
-    /// without the trailing bits, CABAC through the end of the RBSP)
-    new_data: Option<(Arc<Vec<u8>>, usize)>,
+    /// replacement slice data
+    new_data: Option<Arc<SliceDataBits>>,
 }
 
 impl Slice {
@@ -538,16 +564,17 @@ impl Slice {
 
     pub fn slice_data_bits(&self) -> usize {
         match &self.new_data {
-            Some((_, bits)) => *bits,
+            Some(d) => d.bits,
             None => self.rbsp.len() * 8 - self.data_bit,
         }
     }
 
     /// The slice data as (buffer, start bit, end bit). For CAVLC the end is the
-    /// rbsp_stop_one_bit; for CABAC it is the end of the RBSP.
+    /// rbsp_stop_one_bit; for CABAC it is the end of the RBSP. I_PCM samples are byte
+    /// aligned in the buffer.
     pub fn slice_data(&self) -> (&[u8], usize, usize) {
-        if let Some((bytes, bits)) = &self.new_data {
-            return (bytes, 0, *bits);
+        if let Some(d) = &self.new_data {
+            return (&d.bytes, 0, d.bits);
         }
         let end = if self.pps.entropy_coding_mode_flag {
             self.rbsp.len() * 8
@@ -557,14 +584,12 @@ impl Slice {
         (&self.rbsp, self.data_bit, end)
     }
 
-    /// Replace the slice data (`bits` long, as written by `mb::write_slice_data`: for
-    /// CAVLC without the trailing bits, for CABAC including them and any
-    /// cabac_zero_words).
-    pub fn set_slice_data(&mut self, bytes: Vec<u8>, bits: usize) -> Result<()> {
-        if self.pps.entropy_coding_mode_flag && !bits.is_multiple_of(8) {
+    /// Replace the slice data.
+    pub fn set_slice_data(&mut self, data: SliceDataBits) -> Result<()> {
+        if self.pps.entropy_coding_mode_flag && !data.bits.is_multiple_of(8) {
             bail!("CABAC slice data must end byte aligned");
         }
-        self.new_data = Some((Arc::new(bytes), bits));
+        self.new_data = Some(Arc::new(data));
         Ok(())
     }
 
@@ -578,14 +603,14 @@ impl Slice {
             }
             // slice data, rbsp_stop_one_bit and any cabac_zero_words, all byte aligned
             match &self.new_data {
-                Some((bytes, bits)) => w.append_bits(bytes, 0, *bits),
+                Some(d) => d.append_to(&mut w),
                 None => {
                     debug_assert!(self.data_bit.is_multiple_of(8));
                     w.append_bits(&self.rbsp, self.data_bit, self.rbsp.len() * 8);
                 }
             }
-        } else if let Some((bytes, bits)) = &self.new_data {
-            w.append_bits(bytes, 0, *bits);
+        } else if let Some(d) = &self.new_data {
+            d.append_to(&mut w);
             w.trailing_bits();
         } else {
             let Some(stop) = last_one_bit(&self.rbsp) else { bail!("slice without rbsp_stop_one_bit") };
