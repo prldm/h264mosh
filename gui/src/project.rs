@@ -53,8 +53,7 @@ fn one() -> u32 {
 }
 
 impl Encoding {
-    /// The `prep` defaults, with CAVLC so that macroblock effects work, and the
-    /// reference and B-frames chosen for new clips.
+    /// The `prep` defaults (CAVLC), and the reference and B-frames chosen for new clips.
     pub fn for_import(refs: u32, bframes: u32, b_pyramid: BPyramid) -> Self {
         let (preset, keyint) = ("medium".into(), "250".into());
         Self { preset, crf: 18.0, keyint, scenecut: true, cavlc: true, refs: refs.max(1), bframes, b_pyramid }

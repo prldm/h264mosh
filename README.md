@@ -29,6 +29,7 @@ Doing this on the stream, instead of on decoded pixels, means the effects are re
 - Make blocks predict from older reference frames (echoes), and copy macroblocks from one frame into another.
 - Drift brightness and colour through weighted prediction, and change the deblocking strength; these only touch slice headers, so they work on any stream.
 - Every change stays within what the decoder is allowed to compute, so the result is still a valid stream.
+- All of this works on CAVLC and CABAC streams alike, straight from the camera or encoder: macroblocks are parsed into one model and written back with the same entropy coding (interlaced MBAFF streams are not supported yet).
 - Apply effects to chosen frames, in layers, in a chosen order, optionally limited to an area of the picture.
 - Later: a "motion brush" to paint those areas, partial and proportional versions of the healing effects, and moving the motion of one clip onto the picture of another.
 
@@ -52,8 +53,8 @@ The same engine for scripting: prepare clips, mosh them with a plan, inspect str
 
 ### Later, bigger
 
-- Macroblock editing for CABAC streams (today only CAVLC).
 - Motion vector effects on B-frames.
+- Macroblock editing of interlaced MBAFF streams.
 - Audio.
 
 ## Principles

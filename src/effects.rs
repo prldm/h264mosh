@@ -1,4 +1,4 @@
-//! Macroblock-level effects on single slices (CAVLC only), and a few slice-level ones
+//! Macroblock-level effects on single slices (CAVLC or CABAC), and a few slice-level ones
 //! that only rewrite the slice header (any stream).
 
 use crate::intra::{self, MbIntra};
@@ -98,7 +98,8 @@ impl MbEffect {
             || matches!(self, MbEffect::Transplant(..))
     }
 
-    /// Needs the macroblock layer, i.e. a CAVLC stream; the others only change slice headers.
+    /// Needs the macroblock layer (not available for MBAFF streams); the others only change
+    /// slice headers.
     pub fn needs_macroblocks(&self) -> bool {
         !matches!(self, MbEffect::Deblock(..) | MbEffect::Weight(..) | MbEffect::Tint(..))
     }
@@ -309,7 +310,7 @@ fn mb_layer(p: &Pps) -> impl PartialEq + use<'_> {
 pub type Donors = HashMap<usize, std::result::Result<Donor, String>>;
 
 /// Apply `effects` in order to one slice and replace its slice data. Macroblock
-/// effects need a CAVLC slice; slice-level effects rewrite the header only.
+/// effects need the macroblock layer; slice-level effects rewrite the header only.
 pub fn apply(slice: &mut Slice, effects: &[Fx], seed: u64, donors: &Donors) -> Result<EffectStats> {
     let mut stats = EffectStats { slices: 1, ..Default::default() };
     if effects.is_empty() {
@@ -707,7 +708,7 @@ fn fit_levels(mb: &mut Macroblock, new: Macroblock, scaling: &Scaling) {
 
 /// Multiply the levels of a block from scan position `from` (a fraction of the scan
 /// length) on. DC blocks count as frequency 0; Intra16x16 and chroma AC blocks start
-/// at the second position; 8x8 blocks are interleaved into four 4x4 blocks in CAVLC
+/// at the second position; 8x8 blocks are held as four interleaved 4x4 blocks
 /// (level i of the k-th one is coefficient 4i + k of the 8x8 scan).
 fn scale_band(b: &mut CoeffBlock, mb_type: MbType, transform_8x8: bool, from: f32, factor: f32) {
     let pos = |i: usize| -> f32 {
