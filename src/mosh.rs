@@ -219,7 +219,7 @@ pub fn render(src: &Source, timeline: &Timeline, opts: &RenderOptions) -> Result
         }
         upgrade_sps(&mut out, plan.needs);
     }
-    // stream-level preconditions (e.g. CABAC) fail the whole render, not every frame
+    // stream-level preconditions (e.g. MBAFF) fail the whole render, not every frame
     if let Some(f) = out.iter().find(|f| timeline.entries[f.pos].effects.iter().any(|x| x.effect.needs_macroblocks()))
         && let Some(s) = f.au.first_slice()
     {

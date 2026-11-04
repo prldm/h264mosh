@@ -579,7 +579,7 @@ fn cmd_roundtrip(tools: &Tools, input: &Path, output: Option<&PathBuf>, mb: bool
     if mb {
         let m = verify::mb_roundtrip(&stream);
         println!(
-            "  macroblock layer: {} slices identical, {} different, {} unsupported (CABAC/MBAFF), {} macroblocks",
+            "  macroblock layer: {} slices identical, {} different, {} unsupported (MBAFF, FMO, SP/SI), {} macroblocks",
             m.identical, m.different, m.skipped, m.macroblocks
         );
         for (i, f) in &m.failures {

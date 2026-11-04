@@ -507,7 +507,8 @@ pub struct Slice {
     header_bits: usize,
     /// bit position in `rbsp` where slice_data() starts (after any cabac_alignment_one_bit)
     data_bit: usize,
-    /// replacement slice data (CAVLC only): bytes and length in bits, without trailing bits
+    /// replacement slice data: bytes and length in bits, like `slice_data()` (CAVLC
+    /// without the trailing bits, CABAC through the end of the RBSP)
     new_data: Option<(Arc<Vec<u8>>, usize)>,
 }
 
@@ -556,10 +557,12 @@ impl Slice {
         (&self.rbsp, self.data_bit, end)
     }
 
-    /// Replace the slice data of a CAVLC slice (`bits` long, without trailing bits).
+    /// Replace the slice data (`bits` long, as written by `mb::write_slice_data`: for
+    /// CAVLC without the trailing bits, for CABAC including them and any
+    /// cabac_zero_words).
     pub fn set_slice_data(&mut self, bytes: Vec<u8>, bits: usize) -> Result<()> {
-        if self.pps.entropy_coding_mode_flag {
-            bail!("replacing CABAC slice data is not supported");
+        if self.pps.entropy_coding_mode_flag && !bits.is_multiple_of(8) {
+            bail!("CABAC slice data must end byte aligned");
         }
         self.new_data = Some((Arc::new(bytes), bits));
         Ok(())
@@ -574,8 +577,13 @@ impl Slice {
                 w.flag(true);
             }
             // slice data, rbsp_stop_one_bit and any cabac_zero_words, all byte aligned
-            debug_assert!(self.data_bit.is_multiple_of(8));
-            w.append_bits(&self.rbsp, self.data_bit, self.rbsp.len() * 8);
+            match &self.new_data {
+                Some((bytes, bits)) => w.append_bits(bytes, 0, *bits),
+                None => {
+                    debug_assert!(self.data_bit.is_multiple_of(8));
+                    w.append_bits(&self.rbsp, self.data_bit, self.rbsp.len() * 8);
+                }
+            }
         } else if let Some((bytes, bits)) = &self.new_data {
             w.append_bits(bytes, 0, *bits);
             w.trailing_bits();

@@ -141,7 +141,7 @@ pub fn poc_check(aus: &[AccessUnit]) -> PocReport {
 pub struct MbRoundtripReport {
     pub identical: usize,
     pub different: usize,
-    /// CABAC, MBAFF or otherwise unsupported slices
+    /// MBAFF or otherwise unsupported slices
     pub skipped: usize,
     pub macroblocks: usize,
     /// first few failures: (NAL index, description)
@@ -154,7 +154,7 @@ enum MbCheck {
     Checked { macroblocks: usize, problem: Option<String> },
 }
 
-/// Parse the macroblock layer of every CAVLC slice and write it back; the slice data
+/// Parse the macroblock layer of every slice and write it back; the slice data
 /// must come out bit for bit identical. Slices are checked in parallel.
 pub fn mb_roundtrip(stream: &Stream) -> MbRoundtripReport {
     let checks: Vec<MbCheck> = stream

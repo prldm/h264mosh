@@ -1,9 +1,10 @@
-//! Macroblock layer of CAVLC slices (7.3.4 slice_data, 7.3.5 macroblock_layer):
-//! parsing into an editable model and writing it back.
+//! Macroblock layer (7.3.4 slice_data, 7.3.5 macroblock_layer): parsing into an
+//! editable model and writing it back. CAVLC is handled here, CABAC in
+//! [`crate::cabac`], both with the same model.
 //!
-//! Everything that depends on neighbouring macroblocks (nC for coeff_token, QP
-//! prediction) is recomputed on write from the model, so edited slices stay
-//! consistent. Not supported: CABAC, MBAFF, slice groups (FMO), SP/SI slices.
+//! Everything that depends on neighbouring macroblocks (nC for coeff_token, CABAC
+//! contexts, QP prediction) is recomputed on write from the model, so edited slices
+//! stay consistent. Not supported: MBAFF, slice groups (FMO), SP/SI slices.
 
 use crate::bits::{BitReader, BitWriter};
 use crate::cavlc::{read_block, write_block};
@@ -244,9 +245,6 @@ pub struct MbContext<'a> {
 impl<'a> MbContext<'a> {
     pub fn new(slice: &'a Slice) -> Result<Self> {
         let (sps, pps, header) = (slice.sps.as_ref(), slice.pps.as_ref(), &slice.header);
-        if pps.entropy_coding_mode_flag {
-            bail!("macroblock editing needs CAVLC streams (this one is CABAC; use `prep --cavlc`)");
-        }
         if sps.mb_adaptive_frame_field_flag && !header.field_pic_flag {
             bail!("MBAFF streams are not supported");
         }
@@ -271,12 +269,12 @@ impl<'a> MbContext<'a> {
         26 + self.pps.pic_init_qp_minus26 + self.header.slice_qp_delta
     }
 
-    fn luma_planes(&self) -> usize {
+    pub(crate) fn luma_planes(&self) -> usize {
         if self.chroma_array_type == 3 { 3 } else { 1 }
     }
 
     /// chroma 4x4 blocks per component (4:2:0: 4, 4:2:2: 8)
-    fn chroma_blocks(&self) -> usize {
+    pub(crate) fn chroma_blocks(&self) -> usize {
         if self.chroma_array_type == 2 { 8 } else { 4 }
     }
 
@@ -284,11 +282,11 @@ impl<'a> MbContext<'a> {
         if matches!(self.chroma_array_type, 1 | 2) { (&CBP_INTRA, &CBP_INTER) } else { (&CBP_INTRA_GRAY, &CBP_INTER_GRAY) }
     }
 
-    fn num_ref_minus1(&self, list: usize) -> u32 {
+    pub(crate) fn num_ref_minus1(&self, list: usize) -> u32 {
         if list == 0 { self.header.num_ref_idx_l0_active_minus1 } else { self.header.num_ref_idx_l1_active_minus1 }
     }
 
-    fn intra_offset(&self) -> u32 {
+    pub(crate) fn intra_offset(&self) -> u32 {
         match self.slice_type {
             SliceType::P => 5,
             SliceType::B => 23,
@@ -380,7 +378,7 @@ impl Neighbours {
     }
 }
 
-fn wrap_qp(qp: i32, off: i32) -> i32 {
+pub(crate) fn wrap_qp(qp: i32, off: i32) -> i32 {
     (qp + 52 + 2 * off).rem_euclid(52 + off) - off
 }
 
@@ -396,6 +394,35 @@ fn write_te(w: &mut BitWriter, cmax: u32, v: u8) {
     if cmax == 1 { w.flag(v == 0) } else { w.ue(v as u32) }
 }
 
+/// The macroblock type of a coded mb_type value (Tables 7-11, 7-13, 7-14), with the
+/// coded block pattern of Intra16x16 types.
+pub(crate) fn mb_type_from_raw(ctx: &MbContext, raw: u32) -> Result<(MbType, u8)> {
+    match ctx.slice_type {
+        SliceType::P if raw < 5 => Ok((MbType::P(raw as u8), 0)),
+        SliceType::B if raw < 23 => Ok((MbType::B(raw as u8), 0)),
+        _ => decode_intra_type(raw - ctx.intra_offset()),
+    }
+}
+
+/// The coded mb_type value of a macroblock (inverse of [`mb_type_from_raw`]).
+pub(crate) fn mb_type_to_raw(ctx: &MbContext, mb: &Macroblock) -> Result<u32> {
+    let off = ctx.intra_offset();
+    Ok(match mb.mb_type {
+        MbType::P(t) if ctx.slice_type == SliceType::P => t as u32,
+        MbType::B(t) if ctx.slice_type == SliceType::B => t as u32,
+        MbType::INxN => off,
+        MbType::IPcm => off + 25,
+        MbType::I16x16(pred) => {
+            let luma = mb.cbp & 15;
+            if luma != 0 && luma != 15 {
+                bail!("Intra16x16 needs a luma coded block pattern of 0 or 15");
+            }
+            off + 1 + pred as u32 + 4 * (mb.cbp >> 4) as u32 + if luma == 15 { 12 } else { 0 }
+        }
+        t => bail!("{t:?} macroblock in a {:?} slice", ctx.slice_type),
+    })
+}
+
 fn decode_intra_type(t: u32) -> Result<(MbType, u8)> {
     Ok(match t {
         0 => (MbType::INxN, 0),
@@ -409,9 +436,12 @@ fn decode_intra_type(t: u32) -> Result<(MbType, u8)> {
     })
 }
 
-/// Parse slice_data() of a CAVLC slice.
+/// Parse slice_data().
 pub fn parse_slice_data(slice: &Slice) -> Result<SliceData> {
     let ctx = MbContext::new(slice)?;
+    if ctx.pps.entropy_coding_mode_flag {
+        return crate::cabac::parse_slice_data(slice, &ctx);
+    }
     let (buf, start, end) = slice.slice_data();
     let mut r = BitReader::at(buf, start);
     let first_mb = ctx.header.first_mb_in_slice as usize;
@@ -452,28 +482,10 @@ pub fn parse_slice_data(slice: &Slice) -> Result<SliceData> {
 }
 
 fn parse_mb(r: &mut BitReader, ctx: &MbContext, nb: &mut Neighbours, addr: usize, qp: &mut i32) -> Result<Macroblock> {
-    let raw = r.ue()?;
-    let off = ctx.intra_offset();
-    let (mb_type, intra_cbp) = match ctx.slice_type {
-        SliceType::P if raw < 5 => (MbType::P(raw as u8), 0),
-        SliceType::B if raw < 23 => (MbType::B(raw as u8), 0),
-        _ => decode_intra_type(raw - off)?,
-    };
+    let (mb_type, intra_cbp) = mb_type_from_raw(ctx, r.ue()?)?;
     let mut mb = Macroblock::new(mb_type, *qp);
     if mb_type == MbType::IPcm {
-        while !r.byte_aligned() {
-            if r.flag()? {
-                bail!("pcm_alignment_zero_bit is one");
-            }
-        }
-        let (n_luma, n_chroma) = pcm_sizes(ctx);
-        let bd_y = ctx.sps.bit_depth_luma_minus8 + 8;
-        let bd_c = ctx.sps.bit_depth_chroma_minus8 + 8;
-        let mut samples = Vec::with_capacity(n_luma + n_chroma);
-        for i in 0..n_luma + n_chroma {
-            samples.push(r.u(if i < n_luma { bd_y } else { bd_c })? as u16);
-        }
-        mb.pcm = Some(samples);
+        mb.pcm = Some(read_pcm(r, ctx)?);
         nb.tcs.set(addr, TotalCoeffs::filled(16));
         return Ok(mb);
     }
@@ -525,7 +537,7 @@ fn parse_mb(r: &mut BitReader, ctx: &MbContext, nb: &mut Neighbours, addr: usize
     Ok(mb)
 }
 
-fn transform_8x8_mode(ctx: &MbContext) -> bool {
+pub(crate) fn transform_8x8_mode(ctx: &MbContext) -> bool {
     ctx.pps.ext.as_ref().is_some_and(|e| e.transform_8x8_mode_flag)
 }
 
@@ -537,6 +549,37 @@ fn pcm_sizes(ctx: &MbContext) -> (usize, usize) {
         _ => 0,
     };
     (256, chroma)
+}
+
+/// pcm_alignment_zero_bits and the samples of an I_PCM macroblock.
+pub(crate) fn read_pcm(r: &mut BitReader, ctx: &MbContext) -> Result<Vec<u16>> {
+    while !r.byte_aligned() {
+        if r.flag()? {
+            bail!("pcm_alignment_zero_bit is one");
+        }
+    }
+    let (n_luma, n_chroma) = pcm_sizes(ctx);
+    let bd_y = ctx.sps.bit_depth_luma_minus8 + 8;
+    let bd_c = ctx.sps.bit_depth_chroma_minus8 + 8;
+    let mut samples = Vec::with_capacity(n_luma + n_chroma);
+    for i in 0..n_luma + n_chroma {
+        samples.push(r.u(if i < n_luma { bd_y } else { bd_c })? as u16);
+    }
+    Ok(samples)
+}
+
+pub(crate) fn write_pcm(w: &mut BitWriter, ctx: &MbContext, mb: &Macroblock) -> Result<()> {
+    while !w.byte_aligned() {
+        w.flag(false);
+    }
+    let (n_luma, n_chroma) = pcm_sizes(ctx);
+    let Some(samples) = mb.pcm.as_ref().filter(|s| s.len() == n_luma + n_chroma) else { bail!("I_PCM macroblock without samples") };
+    let bd_y = ctx.sps.bit_depth_luma_minus8 + 8;
+    let bd_c = ctx.sps.bit_depth_chroma_minus8 + 8;
+    for (i, &s) in samples.iter().enumerate() {
+        w.u(if i < n_luma { bd_y } else { bd_c }, s as u32);
+    }
+    Ok(())
 }
 
 fn parse_mb_pred(r: &mut BitReader, ctx: &MbContext, mb: &mut Macroblock) -> Result<()> {
@@ -595,7 +638,7 @@ fn write_mvd(w: &mut BitWriter, d: Mvd) {
     w.se(d[1] as i32);
 }
 
-fn uses_list(pred: Pred, list: usize) -> bool {
+pub(crate) fn uses_list(pred: Pred, list: usize) -> bool {
     match pred {
         Pred::Direct => false,
         Pred::Bi => true,
@@ -696,9 +739,15 @@ fn residual(coder: &mut Coder, ctx: &MbContext, nb: &Neighbours, addr: usize, mb
     Ok(())
 }
 
-/// Serialize slice data; returns the bytes and the length in bits (without trailing bits).
+/// Serialize slice data; returns the bytes and the length in bits. CAVLC slice data
+/// ends before the rbsp_slice_trailing_bits; CABAC slice data includes them (the
+/// rbsp_stop_one_bit ends the arithmetic code word) and any cabac_zero_words, like
+/// [`Slice::slice_data`].
 pub fn write_slice_data(slice: &Slice, data: &SliceData) -> Result<(Vec<u8>, usize)> {
     let ctx = MbContext::new(slice)?;
+    if ctx.pps.entropy_coding_mode_flag {
+        return crate::cabac::write_slice_data(slice, &ctx, data);
+    }
     if data.first_mb != ctx.header.first_mb_in_slice as usize {
         bail!("slice data does not start at first_mb_in_slice");
     }
@@ -733,33 +782,9 @@ pub fn write_slice_data(slice: &Slice, data: &SliceData) -> Result<(Vec<u8>, usi
 }
 
 fn write_mb(w: &mut BitWriter, ctx: &MbContext, nb: &mut Neighbours, addr: usize, mb: &Macroblock, qp: &mut i32) -> Result<()> {
-    let off = ctx.intra_offset();
-    let raw = match mb.mb_type {
-        MbType::P(t) if ctx.slice_type == SliceType::P => t as u32,
-        MbType::B(t) if ctx.slice_type == SliceType::B => t as u32,
-        MbType::INxN => off,
-        MbType::IPcm => off + 25,
-        MbType::I16x16(pred) => {
-            let luma = mb.cbp & 15;
-            if luma != 0 && luma != 15 {
-                bail!("Intra16x16 needs a luma coded block pattern of 0 or 15");
-            }
-            off + 1 + pred as u32 + 4 * (mb.cbp >> 4) as u32 + if luma == 15 { 12 } else { 0 }
-        }
-        t => bail!("{t:?} macroblock in a {:?} slice", ctx.slice_type),
-    };
-    w.ue(raw);
+    w.ue(mb_type_to_raw(ctx, mb)?);
     if mb.mb_type == MbType::IPcm {
-        while !w.byte_aligned() {
-            w.flag(false);
-        }
-        let (n_luma, n_chroma) = pcm_sizes(ctx);
-        let Some(samples) = mb.pcm.as_ref().filter(|s| s.len() == n_luma + n_chroma) else { bail!("I_PCM macroblock without samples") };
-        let bd_y = ctx.sps.bit_depth_luma_minus8 + 8;
-        let bd_c = ctx.sps.bit_depth_chroma_minus8 + 8;
-        for (i, &s) in samples.iter().enumerate() {
-            w.u(if i < n_luma { bd_y } else { bd_c }, s as u32);
-        }
+        write_pcm(w, ctx, mb)?;
         nb.tcs.set(addr, TotalCoeffs::filled(16));
         return Ok(());
     }
