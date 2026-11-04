@@ -980,7 +980,9 @@ impl<'a, E: Engine> Coder<'a, E> {
             };
             let v = l.unsigned_abs().saturating_sub(1).min(i32::MAX as u32 - 1) as i32;
             self.se("coeff_abs_level_minus1");
-            let abs = self.string(ueg(v, 0, false, 14), how, |b| match_ueg(b, 0, false, 14))? + 1;
+            let Some(abs) = self.string(ueg(v, 0, false, 14), how, |b| match_ueg(b, 0, false, 14))?.checked_add(1) else {
+                bail!("coeff_abs_level_minus1 out of range");
+            };
             self.se("coeff_sign_flag");
             let neg = self.e.bypass(l < 0);
             levels[i] = if neg { -abs } else { abs };
@@ -1080,7 +1082,7 @@ pub(crate) fn write_slice_data(slice: &Slice, ctx: &MbContext, data: &SliceData)
             w.flag(false);
         }
         let orig_words = orig.iter().rev().take_while(|&&b| b == 0).count() / 2;
-        let words = orig_words.max(zero_words_needed(slice, ctx, data.mbs.len(), bins, w.bit_len() / 8));
+        let words = orig_words.max(zero_words_needed(ctx, data.mbs.len(), bins, w.bit_len() / 8));
         for _ in 0..words {
             w.u(16, 0);
         }
@@ -1129,13 +1131,14 @@ fn header_copy(mb: &Macroblock) -> Macroblock {
 
 /// cabac_zero_words that keep this slice within the bin limit of 7.4.2.10 on its own
 /// (9.3.4.6 applied per slice: if every slice of a picture keeps it, the picture does).
-fn zero_words_needed(slice: &Slice, ctx: &MbContext, mbs: usize, bins: u64, data_bytes: usize) -> usize {
+fn zero_words_needed(ctx: &MbContext, mbs: usize, bins: u64, data_bytes: usize) -> usize {
     let mb_width_c = if ctx.chroma_array_type == 0 { 0 } else { 16 / if ctx.chroma_array_type == 3 { 1 } else { 2 } };
     let mb_height_c = if ctx.chroma_array_type == 0 { 0 } else { 16 / if ctx.chroma_array_type == 1 { 2 } else { 1 } };
     let raw_mb_bits =
         256 * (ctx.sps.bit_depth_luma_minus8 as i64 + 8) + 2 * mb_width_c * mb_height_c * (ctx.sps.bit_depth_chroma_minus8 as i64 + 8);
-    // NAL header byte, slice header and slice data, without emulation prevention bytes
-    let bytes = 1 + slice.header_bits().div_ceil(8) as i64 + data_bytes as i64;
+    // only the NAL header byte and the slice data: the slice header may still change
+    // (frame renumbering), and leaving it and emulation prevention out errs on the safe side
+    let bytes = 1 + data_bytes as i64;
     let ceil_div = |a: i64, b: i64| -((-a).div_euclid(b));
     ceil_div(ceil_div(3 * (32 * bins as i64 - raw_mb_bits * mbs as i64), 1024) - bytes, 3).max(0) as usize
 }
