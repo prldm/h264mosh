@@ -8,7 +8,7 @@ use crate::jobs::{Reporter, Stage};
 use anyhow::{Context, Result, bail};
 use h264mosh::mb::MbContext;
 use h264mosh::mosh::{self, RenderOptions, RenderReport, Source, Timeline};
-use h264mosh::pipeline::{self, BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools};
+use h264mosh::pipeline::{self, BPyramid, Cancelled, EncodeSettings, PrepProgress, Style, Tools};
 use h264mosh::sps::Sps;
 use h264mosh::stream::{NalKind, Stream};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,9 @@ pub struct Encoding {
     pub bframes: u32,
     #[serde(default)]
     pub b_pyramid: BPyramid,
+    /// further libx264 options (the mosh style); none in projects made before styles
+    #[serde(default)]
+    pub x264_params: String,
 }
 
 fn one() -> u32 {
@@ -54,10 +57,19 @@ fn one() -> u32 {
 }
 
 impl Encoding {
-    /// The `prep` defaults (CAVLC), and the reference and B-frames chosen for new clips.
-    pub fn for_import(refs: u32, bframes: u32, b_pyramid: BPyramid) -> Self {
-        let (preset, keyint) = ("medium".into(), "250".into());
-        Self { preset, crf: 18.0, keyint, scenecut: true, cavlc: true, refs: refs.max(1), bframes, b_pyramid }
+    /// New clips: CAVLC in a mosh style, with the reference and B-frames chosen.
+    pub fn for_import(style: Style, refs: u32, bframes: u32, b_pyramid: BPyramid) -> Self {
+        Self {
+            preset: "medium".into(),
+            crf: style.crf(),
+            keyint: "250".into(),
+            scenecut: true,
+            cavlc: true,
+            refs: refs.max(1),
+            bframes,
+            b_pyramid,
+            x264_params: style.x264_params(bframes),
+        }
     }
 
     fn settings(&self) -> EncodeSettings {
@@ -70,8 +82,13 @@ impl Encoding {
             refs: self.refs,
             bframes: self.bframes,
             b_pyramid: self.b_pyramid,
-            x264_params: None,
+            x264_params: Some(self.x264_params.clone()).filter(|p| !p.is_empty()),
         }
+    }
+
+    /// The libx264 options as they are passed to ffmpeg.
+    pub fn describe(&self) -> String {
+        format!("-preset {} -crf {} -x264-params {}", self.preset, self.crf, self.settings().x264_params())
     }
 }
 

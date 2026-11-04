@@ -1,6 +1,7 @@
 use crate::edit::{CardId, Cards, EffectId, RenderSnapshot};
 use crate::export::{self, ExportSettings};
 use crate::history::Gesture;
+use crate::import::{self, ImportSettings};
 use crate::jobs::{Feed, Job, Stage};
 use crate::panel::{self, Action};
 use crate::preview::Preview;
@@ -9,7 +10,7 @@ use crate::settings::Settings;
 use crate::timeline::{Event, Strip, TimelineView};
 use crate::tr;
 use eframe::egui::{self, Align, Key, Layout, Modifiers, RichText, Sense, Vec2};
-use h264mosh::pipeline::{BPyramid, Cancelled, Tools};
+use h264mosh::pipeline::{self, Cancelled, Tools};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +33,12 @@ enum Finished {
     Open(anyhow::Result<Box<Imported>>),
     Render(anyhow::Result<Box<Rendered>>),
     Export(anyhow::Result<()>),
+}
+
+/// Clips waiting for the choice of how they are encoded, and the choices so far.
+struct ImportRequest {
+    paths: Vec<PathBuf>,
+    settings: ImportSettings,
 }
 
 /// What waits for an answer about unsaved changes.
@@ -81,6 +88,8 @@ pub struct App {
     notice: Option<Notice>,
     /// open while Some
     export_dialog: Option<ExportSettings>,
+    /// open while Some
+    import_request: Option<ImportRequest>,
     unsaved_question: Option<AfterSave>,
     allow_close: bool,
     show_shortcuts: bool,
@@ -109,6 +118,7 @@ impl App {
             last_edit: 0.0,
             notice: None,
             export_dialog: None,
+            import_request: None,
             unsaved_question: None,
             allow_close: false,
             show_shortcuts: false,
@@ -147,20 +157,33 @@ impl App {
         }
     }
 
+    /// Open a project, or clips: those that are encoded ask how first.
     fn start_open(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
-        let (tools, cache_dir) = (self.tools.clone(), self.cache_dir.clone());
-        let job = match paths.as_slice() {
+        match paths.as_slice() {
             [file] if project::is_project_file(file) => {
-                let file = file.clone();
-                Job::spawn(ctx, move |r| project::open(&tools, &file, &cache_dir, r))
+                let (tools, cache_dir, file) = (self.tools.clone(), self.cache_dir.clone(), file.clone());
+                self.job = Some(Running::Open(Job::spawn(ctx, move |r| project::open(&tools, &file, &cache_dir, r))));
             }
-            _ => {
-                let s = &self.settings;
-                let encoding = (!s.import_as_coded).then(|| Encoding::for_import(s.import_refs, s.import_bframes, s.import_b_pyramid));
-                Job::spawn(ctx, move |r| project::import(&tools, &paths, &cache_dir, encoding, r))
-            }
-        };
-        self.job = Some(Running::Open(job));
+            _ if self.settings.import_as_coded => self.start_import(ctx, paths, None),
+            _ => self.import_request = Some(ImportRequest { paths, settings: self.settings.import }),
+        }
+    }
+
+    fn start_import(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>, encoding: Option<Encoding>) {
+        let (tools, cache_dir) = (self.tools.clone(), self.cache_dir.clone());
+        self.job = Some(Running::Open(Job::spawn(ctx, move |r| project::import(&tools, &paths, &cache_dir, encoding, r))));
+    }
+
+    fn import_dialog(&mut self, ctx: &egui::Context) {
+        let Some(request) = &mut self.import_request else { return };
+        let raw = matches!(request.paths.as_slice(), [single] if pipeline::is_raw_h264(single));
+        let Some(go) = import::dialog(ctx, &mut request.settings, raw) else { return };
+        let ImportRequest { paths, settings } = self.import_request.take().expect("the dialog is open");
+        if go {
+            self.settings.import = settings;
+            self.settings.save();
+            self.start_import(ctx, paths, Some(settings.encoding()));
+        }
     }
 
     fn choose_file(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -498,7 +521,11 @@ impl App {
     // ---- keyboard ----
 
     fn keyboard(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if ctx.egui_wants_keyboard_input() || self.export_dialog.is_some() || self.unsaved_question.is_some() {
+        if ctx.egui_wants_keyboard_input()
+            || self.export_dialog.is_some()
+            || self.import_request.is_some()
+            || self.unsaved_question.is_some()
+        {
             return;
         }
         // single keys act on the press, not on key repeat
@@ -602,30 +629,6 @@ impl App {
                 });
                 ui.menu_button(tr!("menu-new-clips"), |ui| {
                     let s = &mut self.settings;
-                    // the encoding choices do not apply to clips that keep their coding
-                    ui.add_enabled_ui(!s.import_as_coded, |ui| {
-                        for refs in [1, 2, 4] {
-                            let label = tr!("import-refs", count = refs);
-                            let hint = if refs == 1 { tr!("import-refs-one-tooltip") } else { tr!("import-refs-more-tooltip") };
-                            if ui.radio_value(&mut s.import_refs, refs, label).on_hover_text(hint).changed() {
-                                s.save();
-                            }
-                        }
-                        ui.separator();
-                        let choices = [
-                            (0, BPyramid::None, tr!("import-bframes-none"), tr!("import-bframes-none-tooltip")),
-                            (3, BPyramid::None, tr!("import-bframes", count = 3), tr!("import-bframes-tooltip")),
-                            (3, BPyramid::Normal, tr!("import-bframes-pyramid", count = 3), tr!("import-bframes-pyramid-tooltip")),
-                        ];
-                        for (bframes, pyramid, label, hint) in choices {
-                            let chosen = s.import_bframes == bframes && (bframes == 0 || s.import_b_pyramid == pyramid);
-                            if ui.radio(chosen, label).on_hover_text(hint).clicked() && !chosen {
-                                (s.import_bframes, s.import_b_pyramid) = (bframes, pyramid);
-                                s.save();
-                            }
-                        }
-                    });
-                    ui.separator();
                     if ui.checkbox(&mut s.import_as_coded, tr!("import-as-coded")).on_hover_text(tr!("import-as-coded-tooltip")).changed() {
                         s.save();
                     }
@@ -1084,6 +1087,7 @@ impl eframe::App for App {
                 }
             }
         }
+        self.import_dialog(&ctx);
         self.unsaved_dialog(&ctx, frame);
         self.shortcuts_window(&ctx);
         if std::mem::take(&mut self.want_open) {
@@ -1099,6 +1103,7 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     use h264mosh::effects::{Mask, MbEffect};
+    use h264mosh::pipeline::{Healing, Motion, Style};
     use std::process::Command;
     use std::time::Duration;
 
@@ -1172,6 +1177,10 @@ mod tests {
         let ctx = h.ctx.clone();
         h.state_mut().notice = None;
         h.state_mut().start_open(&ctx, paths);
+        // clips to encode ask how first: as chosen before
+        if let Some(ImportRequest { paths, settings }) = h.state_mut().import_request.take() {
+            h.state_mut().start_import(&ctx, paths, Some(settings.encoding()));
+        }
         wait(h, |a| a.job.is_none());
     }
 
@@ -1241,6 +1250,15 @@ mod tests {
 
     fn mouse(h: &mut Harness<App>, pos: egui::Pos2, pressed: bool, modifiers: Modifiers) {
         h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers });
+    }
+
+    /// Click the widget labelled `label`.
+    fn press(h: &mut Harness<App>, label: &str) {
+        let pos = h.get_by_label(label).rect().center();
+        h.hover_at(pos);
+        mouse(h, pos, true, Modifiers::NONE);
+        mouse(h, pos, false, Modifiers::NONE);
+        h.run_steps(2);
     }
 
     /// Click the middle of card `i`.
@@ -1434,10 +1452,52 @@ mod tests {
         // new clips with more reference frames
         let mp4 = test_clip("refs.mp4", 1, "320x180").unwrap();
         let mut k = harness(false);
-        k.state_mut().settings.import_refs = 2;
+        k.state_mut().settings.import.refs = 2;
         open(&mut k, mp4);
         assert_eq!(project(&k).refs, 2);
         assert_eq!(project(&k).encoding.as_ref().unwrap().refs, 2);
+    }
+
+    /// Opening clips asks how to encode them: the choices are used and remembered, and
+    /// cancelling opens nothing and forgets them.
+    #[test]
+    fn opening_clips_asks_how_to_encode() {
+        let Some(mp4) = test_clip("ask.mp4", 1, "320x180") else { return };
+        let mut h = harness(false);
+        let ctx = h.ctx.clone();
+        h.state_mut().start_open(&ctx, vec![mp4.clone()]);
+        h.run_steps(2);
+        assert!(h.state().job.is_none(), "nothing is encoded before the choice");
+        for label in [tr!("motion-detailed"), tr!("healing-fast"), tr!("cancel-button")] {
+            press(&mut h, &label);
+        }
+        let a = h.state();
+        assert!(a.import_request.is_none() && a.job.is_none() && a.project.is_none());
+        assert_eq!(a.settings.import, ImportSettings::default());
+
+        h.state_mut().start_open(&ctx, vec![mp4]);
+        h.run_steps(2);
+        for label in [tr!("motion-detailed"), tr!("healing-fast"), tr!("import-encode")] {
+            press(&mut h, &label);
+        }
+        assert!(h.state().import_request.is_none() && h.state().job.is_some());
+        wait(&mut h, |a| a.job.is_none());
+        assert!(h.state().notice.is_none(), "{}", h.state().notice.as_ref().unwrap().text);
+        let enc = project(&h).encoding.clone().unwrap();
+        assert_eq!(enc.crf, 16.0);
+        assert!(
+            enc.x264_params.contains("partitions=p8x8,b8x8,p4x4,i4x4,i8x8") && enc.x264_params.contains("me=umh"),
+            "{}",
+            enc.x264_params
+        );
+        assert_eq!(h.state().settings.import.style, Style { motion: Motion::Detailed, healing: Healing::Fast });
+
+        // clips that keep their coding are not asked about
+        h.state_mut().settings.import_as_coded = true;
+        let raw = test_clip("ask.264", 1, "320x180").unwrap();
+        h.state_mut().start_open(&ctx, vec![raw]);
+        assert!(h.state().import_request.is_none() && h.state().job.is_some());
+        wait(&mut h, |a| a.job.is_none());
     }
 
     /// Clips imported with B-frames: the timeline shows them in display order, with
@@ -1446,7 +1506,7 @@ mod tests {
     fn bframe_clips_edit_in_display_order() {
         let Some(mp4) = test_clip("bframes.mp4", 2, "320x180") else { return };
         let mut h = harness(false);
-        h.state_mut().settings.import_bframes = 3;
+        h.state_mut().settings.import.bframes = 3;
         open(&mut h, mp4);
         let p = project(&h);
         assert_eq!(p.encoding.as_ref().unwrap().bframes, 3);
@@ -1604,6 +1664,11 @@ mod tests {
         shot(&mut h, "1_empty");
         let ctx = h.ctx.clone();
         h.state_mut().start_open(&ctx, vec![clip]);
+        if h.state().import_request.is_some() {
+            shot(&mut h, "1b_import_dialog");
+            let ImportRequest { paths, settings } = h.state_mut().import_request.take().unwrap();
+            h.state_mut().start_import(&ctx, paths, Some(settings.encoding()));
+        }
         // catch the progress bar of clips that need encoding
         for _ in 0..3000 {
             h.step();
@@ -1663,6 +1728,10 @@ mod tests {
         shot(&mut h, "5_dialogs");
         h.state_mut().show_shortcuts = false;
         h.state_mut().export_dialog = None;
+        let settings = ImportSettings { bframes: 2, refs: 2, ..Default::default() };
+        h.state_mut().import_request = Some(ImportRequest { paths: Vec::new(), settings });
+        shot(&mut h, "5b_import_dialog_bframes");
+        h.state_mut().import_request = None;
 
         h.state_mut().timeline.zoom = 6.0;
         shot(&mut h, "6_zoomed_out");

@@ -8,6 +8,7 @@ mod edit;
 mod export;
 mod history;
 mod i18n;
+mod import;
 mod jobs;
 mod panel;
 mod preview;

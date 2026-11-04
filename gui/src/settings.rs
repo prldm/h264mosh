@@ -2,44 +2,26 @@
 //! the user's configuration folder.
 
 use crate::export::ExportSettings;
-use h264mosh::pipeline::BPyramid;
+use crate::import::ImportSettings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const MAX_RECENT: usize = 10;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// most recent first
     pub recent: Vec<PathBuf>,
     pub auto_render: bool,
     pub export: ExportSettings,
-    /// reference frames of newly imported clips
-    pub import_refs: u32,
-    /// B-frames of newly imported clips, and whether they are references too
-    pub import_bframes: u32,
-    pub import_b_pyramid: BPyramid,
+    /// how newly imported clips are encoded
+    pub import: ImportSettings,
     /// newly imported clips keep their coding (no re-encoding; experimental)
     pub import_as_coded: bool,
     /// where it is stored; None keeps it in memory only (tests)
     #[serde(skip)]
     path: Option<PathBuf>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            recent: Vec::new(),
-            auto_render: false,
-            export: ExportSettings::default(),
-            import_refs: 1,
-            import_bframes: 0,
-            import_b_pyramid: BPyramid::None,
-            import_as_coded: false,
-            path: None,
-        }
-    }
 }
 
 /// The user's configuration folder for h264mosh.

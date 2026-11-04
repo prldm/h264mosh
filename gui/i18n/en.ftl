@@ -7,7 +7,7 @@ window-title = { $project } – h264mosh
 window-title-unsaved = • { $project } – h264mosh
 empty-hint = Open one or more clips or a project to start, or drop them here.
 open-button = Open…
-open-tooltip = Open a project, or video clips: they are re-encoded with datamosh-friendly settings; a raw .264 stream opens as it is.
+open-tooltip = Open a project, or video clips: they are re-encoded for moshing, the way you choose; a raw .264 stream that can be edited opens as it is.
 
 ## Menus
 
@@ -18,29 +18,8 @@ menu-save = Save
 menu-save-as = Save as…
 menu-export = Export…
 menu-new-clips = New clips
-import-refs =
-    { $count ->
-        [one] 1 reference frame
-       *[other] { $count } reference frames
-    }
-import-refs-one-tooltip = Clips opened from now on are encoded with one reference frame: the classic datamosh.
-import-refs-more-tooltip = Clips opened from now on are encoded with several reference frames, for the Echo effect. Frame edits work as well, but motion may come from older frames.
-import-bframes-none = No B-frames
-import-bframes-none-tooltip = Clips opened from now on have I- and P-frames only: every effect works on every frame.
-import-bframes =
-    { $count ->
-        [one] 1 B-frame
-       *[other] { $count } B-frames
-    }
-import-bframes-tooltip = Clips opened from now on get B-frames, which predict from the frames before and after them. Moved to other places they take their motion from new neighbours. Effects change them too, except the brightness and colour drifts.
-import-bframes-pyramid =
-    { $count ->
-        [one] 1 B-frame, also as reference
-       *[other] { $count } B-frames, also as references
-    }
-import-bframes-pyramid-tooltip = Like B-frames, and some B-frames are references for the others (as most encoders do it), so moving one changes its neighbours too.
 import-as-coded = Keep the original coding: CABAC, MBAFF (experimental)
-import-as-coded-tooltip = Clips opened from now on are not re-encoded: their H.264 stream is used exactly as the camera or encoder made it, so the choices above do not apply. Clips joined this way have to be coded alike. Macroblock effects on CABAC streams are new; interlaced MBAFF streams take frame edits and the picture effects only. Without this, clips are encoded to CAVLC for moshing (raw CAVLC streams are used as they are).
+import-as-coded-tooltip = Clips opened from now on are not re-encoded: their H.264 stream is used exactly as the camera or encoder made it, and nothing is asked about encoding. Clips joined this way have to be coded alike. Macroblock effects on CABAC streams are new; interlaced MBAFF streams take frame edits and the picture effects only. Without this, clips are encoded to CAVLC for moshing, as chosen when they are opened (raw CAVLC streams are used as they are).
 menu-edit = Edit
 menu-undo = Undo
 menu-redo = Redo
@@ -52,6 +31,38 @@ filter-project = h264mosh project
 filter-video = Video
 filter-mp4 = MP4 video
 filter-raw = Raw H.264 stream
+
+## Encoding new clips (asked when they are opened)
+
+import-title = Encode for moshing
+import-intro = The clips are encoded again before you edit them. How they are encoded decides how they mosh.
+import-raw-note = A raw CAVLC stream that can be edited opens as it is; these choices apply only if it has to be encoded.
+import-motion = Motion
+motion-flowing = Flowing
+motion-balanced = Balanced
+motion-detailed = Detailed
+motion-flowing-about = Whole blocks move together and follow the main motion: the picture slides and melts in calm, even pieces, steady from frame to frame.
+motion-balanced-about = Blocks can split into four to follow smaller movements: the smear breaks up a little more.
+motion-detailed-about = Small blocks chase every movement, noise included: busier and more ragged, with stray blocks going their own way.
+import-healing = Healing
+healing-slow = Slow
+healing-normal = Normal
+healing-fast = Fast
+healing-slow-about = After a dropped keyframe the frames carry little besides motion: the smear lasts longest. The whole picture is a little softer.
+healing-normal-about = The new picture seeps through the smear gradually, as detail and colour.
+healing-fast-about = The new picture comes back quickly, much of it as sharp squares breaking through the smear here and there.
+import-bframes = B-frames
+bframes-none = None
+bframes-pyramid = as references
+bframes-pyramid-tooltip = Some B-frames are references for the others, as most encoders do it: moving one changes its neighbours too, and the motion is a little less steady.
+bframes-none-about = Every frame is a P-frame and pushes the smear on by one step: the classic datamosh, and every effect works on every frame.
+bframes-about = B-frames sit between the P-frames and blend the pictures before and after them: the smear moves in smaller, smoother steps, while the P-frames jump further and heal a little more. A B-frame moved elsewhere takes its motion from its new neighbours. The brightness and colour drifts skip B-frames.
+import-refs = Reference frames
+refs-one-about = Every frame predicts from the one before it: the classic datamosh.
+refs-more-about = Blocks may also predict from older frames, which the Echo effect plays with. Frame edits work as well, but motion may come from older frames.
+import-encode = Encode
+import-recommended = Recommended
+import-recommended-tooltip = Flowing motion, normal healing, no B-frames, one reference frame: steady motion, and few blocks breaking through.
 
 ## Header
 
