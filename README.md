@@ -44,6 +44,7 @@ A desktop app (Rust, egui) built around the idea that nothing is final and every
 - Comparison: wipe, side by side, flicker and difference against the original, plus variants (A/B/C) of the same edit and a grid that tries four parameter values at once.
 - Ramps (parameters that change over time) and presets.
 - Previews decoded in the background at reduced size, by the same software decoder that is used for the export, so what you see is what you get.
+- Clips are re-encoded to CAVLC when they are opened, the most tested path; an experimental option keeps their original coding (CABAC, MBAFF) and uses their streams exactly as they are.
 - Export as a raw stream, as the moshed stream in an MP4 without re-encoding, or as an ordinary video with the mosh baked in.
 - The interface is English, but written to be translated from the start.
 

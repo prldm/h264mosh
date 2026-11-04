@@ -16,6 +16,11 @@ pub enum Stage {
         clip: usize,
         clips: usize,
     },
+    /// copying the H.264 stream of clip `clip` out of its file
+    Copying {
+        clip: usize,
+        clips: usize,
+    },
     Reading,
     Rendering,
     Exporting,

@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use h264mosh::mb::MbContext;
 use h264mosh::mosh::{self, RenderOptions, RenderReport, Source, Timeline};
 use h264mosh::pipeline::{self, BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools};
+use h264mosh::sps::Sps;
 use h264mosh::stream::{NalKind, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -166,7 +167,8 @@ struct ProjectFile {
     /// the raw stream the edit is based on
     stream: PathBuf,
     stream_hash: String,
-    /// how the inputs were encoded into the stream; none if the stream is the input
+    /// how the inputs were encoded into the stream; none if they are used as they are
+    /// coded (the stream is the input, or copied out of the inputs)
     encoding: Option<Encoding>,
     frames: usize,
     edit: EditState,
@@ -218,12 +220,17 @@ pub fn is_project_file(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION))
 }
 
-/// Encode `inputs` into a new stream file in `cache_dir`.
-fn prepare(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: &Encoding, r: &Reporter) -> Result<(PathBuf, Vec<u8>)> {
+/// A new stream file in `cache_dir`, named after the first input.
+fn new_stream_file(inputs: &[PathBuf], cache_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(cache_dir).with_context(|| format!("creating {}", cache_dir.display()))?;
     let stem = inputs[0].file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let output = cache_dir.join(format!("{stem}-{stamp}.264"));
+    Ok(cache_dir.join(format!("{stem}-{stamp}.264")))
+}
+
+/// Encode `inputs` into a new stream file in `cache_dir`.
+fn prepare(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: &Encoding, r: &Reporter) -> Result<(PathBuf, Vec<u8>)> {
+    let output = new_stream_file(inputs, cache_dir)?;
     let (mut clip, mut clip_frames) = (0, None);
     pipeline::prep(tools, inputs, &output, None, None, &encoding.settings(), &mut |p| {
         match p {
@@ -236,6 +243,59 @@ fn prepare(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: &Encod
     r.set(Stage::Reading, 0, None);
     let data = std::fs::read(&output).with_context(|| format!("reading {}", output.display()))?;
     Ok((output, data))
+}
+
+/// The H.264 streams of `inputs` as they are coded, one after the other: a single raw
+/// stream is used where it is, anything else is copied into a new stream file in
+/// `cache_dir`.
+fn copy(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, r: &Reporter) -> Result<(PathBuf, Vec<u8>)> {
+    if let [single] = inputs
+        && pipeline::is_raw_h264(single)
+    {
+        r.set(Stage::Reading, 0, None);
+        let data = std::fs::read(single).with_context(|| format!("reading {}", single.display()))?;
+        return Ok((single.clone(), data));
+    }
+    let mut joined = Vec::new();
+    let mut first: Option<Sps> = None;
+    for (i, input) in inputs.iter().enumerate() {
+        if r.cancelled() {
+            return Err(Cancelled.into());
+        }
+        r.set(Stage::Copying { clip: i, clips: inputs.len() }, 0, None);
+        let data = pipeline::load_annexb(tools, input)?;
+        let stream = Stream::parse(&data).with_context(|| format!("reading the H.264 stream of {}", input.display()))?;
+        let Some(sps) = first_sps(&stream) else { bail!("{}: no H.264 sequence parameter set found", input.display()) };
+        // frames of one clip are predicted from the other's once the joins are moshed
+        match &first {
+            None => first = Some((*sps).clone()),
+            Some(f) if *f != *sps => bail!(
+                "{} is coded differently than the first clip ({}); such clips can only be joined re-encoded",
+                input.display(),
+                f.differences(&sps)
+            ),
+            _ => {}
+        }
+        joined.extend_from_slice(&data);
+    }
+    let output = new_stream_file(inputs, cache_dir)?;
+    std::fs::write(&output, &joined).with_context(|| format!("writing {}", output.display()))?;
+    Ok((output, joined))
+}
+
+fn first_sps(stream: &Stream) -> Option<Arc<Sps>> {
+    stream.nals.iter().find_map(|n| match &n.kind {
+        NalKind::Sps(s) => Some(s.clone()),
+        _ => None,
+    })
+}
+
+/// Whether the default import can use a raw stream as it is: CAVLC, with macroblocks
+/// that can be edited.
+fn mosh_ready(data: &[u8]) -> bool {
+    Stream::parse(data).is_ok_and(|stream| {
+        stream.nals.iter().filter_map(|n| n.slice()).all(|s| !s.pps.entropy_coding_mode_flag && MbContext::new(s).is_ok())
+    })
 }
 
 /// Parse a stream into a project with an unedited timeline.
@@ -252,11 +312,7 @@ fn load(
     }
     r.set(Stage::Reading, 0, None);
     let stream = Stream::parse(&data)?;
-    let sps = stream.nals.iter().find_map(|n| match &n.kind {
-        NalKind::Sps(s) => Some(s.clone()),
-        _ => None,
-    });
-    let Some(sps) = sps else { bail!("{name}: no H.264 sequence parameter set found") };
+    let Some(sps) = first_sps(&stream) else { bail!("{name}: no H.264 sequence parameter set found") };
     let macroblocks = stream.nals.iter().filter_map(|n| n.slice()).all(|s| MbContext::new(s).is_ok());
     let source = Source::new(stream);
     if source.is_empty() {
@@ -289,25 +345,36 @@ fn load(
     })
 }
 
-/// Open clips: a single raw H.264 stream is used as it is; anything else is encoded
-/// with mosh-friendly settings (`encoding`) into `cache_dir` first.
-pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: Encoding, r: &Reporter) -> Result<Imported> {
+/// Open clips. With `encoding`, they are encoded with these mosh-friendly settings into
+/// `cache_dir` first, unless they are a single raw H.264 stream that is CAVLC with
+/// editable macroblocks already. Without (experimental), they are used as they are
+/// coded: their H.264 streams are copied out of their files.
+pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: Option<Encoding>, r: &Reporter) -> Result<Imported> {
     let name = inputs.first().map(|p| name_of(p)).unwrap_or_default();
-    let project = if let [single] = inputs
-        && pipeline::is_raw_h264(single)
-    {
-        r.set(Stage::Reading, 0, None);
-        let data = std::fs::read(single).with_context(|| format!("reading {}", single.display()))?;
-        load(name, inputs.to_vec(), single.clone(), None, data, r)?
-    } else {
-        let (stream, data) = prepare(tools, inputs, cache_dir, &encoding, r)?;
-        load(name, inputs.to_vec(), stream, Some(encoding), data, r)?
+    let raw = match inputs {
+        [single] if encoding.is_some() && pipeline::is_raw_h264(single) => {
+            r.set(Stage::Reading, 0, None);
+            Some(std::fs::read(single).with_context(|| format!("reading {}", single.display()))?).filter(|d| mosh_ready(d))
+        }
+        _ => None,
     };
+    let (stream, data, encoding) = match (raw, encoding) {
+        (Some(data), _) => (inputs[0].clone(), data, None),
+        (None, Some(encoding)) => {
+            let (stream, data) = prepare(tools, inputs, cache_dir, &encoding, r)?;
+            (stream, data, Some(encoding))
+        }
+        (None, None) => {
+            let (stream, data) = copy(tools, inputs, cache_dir, r)?;
+            (stream, data, None)
+        }
+    };
+    let project = load(name, inputs.to_vec(), stream, encoding, data, r)?;
     let rendered = project.original.clone();
     Ok(Imported { project, rendered, snapshot: None })
 }
 
-/// Open a project file. If its stream is gone, the clips are encoded again.
+/// Open a project file. If its stream is gone, the clips are encoded or copied again.
 pub fn open(tools: &Tools, path: &Path, cache_dir: &Path, r: &Reporter) -> Result<Imported> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: ProjectFile = serde_json::from_str(&text).with_context(|| format!("{} is not a h264mosh project", path.display()))?;
@@ -316,15 +383,19 @@ pub fn open(tools: &Tools, path: &Path, cache_dir: &Path, r: &Reporter) -> Resul
     }
     r.set(Stage::Reading, 0, None);
     let stored = std::fs::read(&file.stream).ok().filter(|d| format!("{:016x}", hash(d)) == file.stream_hash);
-    let reencoded = stored.is_none();
+    let new_stream = stored.is_none();
+    // imported as coded, copied out of clips that are not raw streams
+    let copied = file.encoding.is_none() && !file.inputs.contains(&file.stream);
+    if new_stream
+        && (file.encoding.is_some() || copied)
+        && let Some(missing) = file.inputs.iter().find(|p| !p.is_file())
+    {
+        bail!("the stream {} is gone, and so is the clip {}", file.stream.display(), missing.display());
+    }
     let (stream_path, data) = match (stored, &file.encoding) {
         (Some(data), _) => (file.stream.clone(), data),
-        (None, Some(encoding)) => {
-            if let Some(missing) = file.inputs.iter().find(|p| !p.is_file()) {
-                bail!("the stream {} is gone, and so is the clip {}", file.stream.display(), missing.display());
-            }
-            prepare(tools, &file.inputs, cache_dir, encoding, r)?
-        }
+        (None, Some(encoding)) => prepare(tools, &file.inputs, cache_dir, encoding, r)?,
+        (None, None) if copied => copy(tools, &file.inputs, cache_dir, r)?,
         (None, None) => bail!("the stream {} is missing or was changed", file.stream.display()),
     };
     let mut project = load(name_of(path), file.inputs, stream_path, file.encoding, data, r)?;
@@ -341,8 +412,8 @@ pub fn open(tools: &Tools, path: &Path, cache_dir: &Path, r: &Reporter) -> Resul
         card.effects.retain(|e| effects.contains(e));
     }
     project.cards = Cards::from_state(edit);
-    if !reencoded {
-        // a re-encoded stream is a change worth saving
+    if !new_stream {
+        // a stream encoded or copied again is a change worth saving
         project.saved = Some(project.cards.state());
     }
     project.file = Some(path.to_path_buf());

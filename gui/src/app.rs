@@ -156,7 +156,7 @@ impl App {
             }
             _ => {
                 let s = &self.settings;
-                let encoding = Encoding::for_import(s.import_refs, s.import_bframes, s.import_b_pyramid);
+                let encoding = (!s.import_as_coded).then(|| Encoding::for_import(s.import_refs, s.import_bframes, s.import_b_pyramid));
                 Job::spawn(ctx, move |r| project::import(&tools, &paths, &cache_dir, encoding, r))
             }
         };
@@ -601,26 +601,33 @@ impl App {
                     });
                 });
                 ui.menu_button(tr!("menu-new-clips"), |ui| {
-                    for refs in [1, 2, 4] {
-                        let label = tr!("import-refs", count = refs);
-                        let hint = if refs == 1 { tr!("import-refs-one-tooltip") } else { tr!("import-refs-more-tooltip") };
-                        if ui.radio_value(&mut self.settings.import_refs, refs, label).on_hover_text(hint).changed() {
-                            self.settings.save();
-                        }
-                    }
-                    ui.separator();
                     let s = &mut self.settings;
-                    let choices = [
-                        (0, BPyramid::None, tr!("import-bframes-none"), tr!("import-bframes-none-tooltip")),
-                        (3, BPyramid::None, tr!("import-bframes", count = 3), tr!("import-bframes-tooltip")),
-                        (3, BPyramid::Normal, tr!("import-bframes-pyramid", count = 3), tr!("import-bframes-pyramid-tooltip")),
-                    ];
-                    for (bframes, pyramid, label, hint) in choices {
-                        let chosen = s.import_bframes == bframes && (bframes == 0 || s.import_b_pyramid == pyramid);
-                        if ui.radio(chosen, label).on_hover_text(hint).clicked() && !chosen {
-                            (s.import_bframes, s.import_b_pyramid) = (bframes, pyramid);
-                            s.save();
+                    // the encoding choices do not apply to clips that keep their coding
+                    ui.add_enabled_ui(!s.import_as_coded, |ui| {
+                        for refs in [1, 2, 4] {
+                            let label = tr!("import-refs", count = refs);
+                            let hint = if refs == 1 { tr!("import-refs-one-tooltip") } else { tr!("import-refs-more-tooltip") };
+                            if ui.radio_value(&mut s.import_refs, refs, label).on_hover_text(hint).changed() {
+                                s.save();
+                            }
                         }
+                        ui.separator();
+                        let choices = [
+                            (0, BPyramid::None, tr!("import-bframes-none"), tr!("import-bframes-none-tooltip")),
+                            (3, BPyramid::None, tr!("import-bframes", count = 3), tr!("import-bframes-tooltip")),
+                            (3, BPyramid::Normal, tr!("import-bframes-pyramid", count = 3), tr!("import-bframes-pyramid-tooltip")),
+                        ];
+                        for (bframes, pyramid, label, hint) in choices {
+                            let chosen = s.import_bframes == bframes && (bframes == 0 || s.import_b_pyramid == pyramid);
+                            if ui.radio(chosen, label).on_hover_text(hint).clicked() && !chosen {
+                                (s.import_bframes, s.import_b_pyramid) = (bframes, pyramid);
+                                s.save();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if ui.checkbox(&mut s.import_as_coded, tr!("import-as-coded")).on_hover_text(tr!("import-as-coded-tooltip")).changed() {
+                        s.save();
                     }
                 });
                 ui.separator();
@@ -697,6 +704,7 @@ impl App {
         let text = match progress.stage {
             Stage::Starting => tr!("stage-starting"),
             Stage::Encoding { clip, clips } => tr!("stage-encoding", clip = clip + 1, clips = clips),
+            Stage::Copying { clip, clips } => tr!("stage-copying", clip = clip + 1, clips = clips),
             Stage::Reading => tr!("stage-reading"),
             Stage::Rendering => tr!("stage-rendering"),
             Stage::Exporting => tr!("stage-exporting"),
@@ -1119,6 +1127,19 @@ mod tests {
         Some(path)
     }
 
+    /// A two-second CABAC clip, coded as most encoders do (`test_clip` makes CAVLC).
+    fn cabac_clip(name: &str) -> PathBuf {
+        let path = test_dir().join(name);
+        let mut cmd = Command::new(Tools::find(None).ffmpeg);
+        cmd.args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-t", "2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-bf", "0"]);
+        if name.ends_with(".264") {
+            cmd.args(["-f", "h264"]);
+        }
+        assert!(cmd.arg(&path).status().unwrap().success());
+        path
+    }
+
     fn harness(gpu: bool) -> Harness<'static, App> {
         let builder = Harness::builder().with_size([1280.0, 800.0]);
         let builder = if gpu { builder.wgpu() } else { builder };
@@ -1142,10 +1163,16 @@ mod tests {
     }
 
     fn open(h: &mut Harness<App>, path: PathBuf) {
-        let ctx = h.ctx.clone();
-        h.state_mut().start_open(&ctx, vec![path]);
-        wait(h, |a| a.job.is_none());
+        open_all(h, vec![path]);
         assert!(h.state().notice.is_none(), "{}", h.state().notice.as_ref().unwrap().text);
+    }
+
+    /// Open clips; the notice, if any, tells how it went.
+    fn open_all(h: &mut Harness<App>, paths: Vec<PathBuf>) {
+        let ctx = h.ctx.clone();
+        h.state_mut().notice = None;
+        h.state_mut().start_open(&ctx, paths);
+        wait(h, |a| a.job.is_none());
     }
 
     fn render(h: &mut Harness<App>) {
@@ -1387,17 +1414,12 @@ mod tests {
         key(&mut h, Key::Z, Modifiers::COMMAND);
         assert_eq!(project(&h).cards.effect(lanes[0]).unwrap().mask, None);
 
-        // a CABAC stream takes macroblock and picture effects
-        let cabac = test_dir().join("cabac.264");
-        let status = Command::new(Tools::find(None).ffmpeg)
-            .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-t", "2"])
-            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-bf", "0", "-f", "h264"])
-            .arg(&cabac)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        // a CABAC stream that keeps its coding takes macroblock and picture effects
+        let cabac = cabac_clip("cabac.264");
         let mut g = harness(false);
-        open(&mut g, cabac);
+        g.state_mut().settings.import_as_coded = true;
+        open(&mut g, cabac.clone());
+        assert!(project(&g).encoding.is_none() && project(&g).stream_path == cabac);
         assert!(project(&g).macroblocks);
         g.state_mut().timeline.selection = (10..20).collect();
         let ctx = g.ctx.clone();
@@ -1441,6 +1463,51 @@ mod tests {
         assert_eq!(out.len(), srcs.len());
         assert_eq!(out.frame_of(b.id), Some(19));
         assert_eq!(out.report.frames[19].src, b.src);
+    }
+
+    /// By default clips are encoded to CAVLC (raw CAVLC streams are used as they are);
+    /// clips that keep their coding are copied out of their files, joined only if they
+    /// are coded alike, and copied again when a project is opened without its stream.
+    #[test]
+    fn clips_keep_their_coding_when_asked() {
+        let Some(cavlc) = test_clip("coding.264", 1, "320x180") else { return };
+        let (cabac, mp4) = (cabac_clip("coding_cabac.264"), cabac_clip("coding_cabac.mp4"));
+        let cabac_slices = |p: &Project| {
+            let stream = h264mosh::stream::Stream::parse(&p.data).unwrap();
+            stream.nals.iter().filter_map(|n| n.slice()).all(|s| s.pps.entropy_coding_mode_flag)
+        };
+        let mut h = harness(false);
+        open(&mut h, cavlc.clone());
+        assert!(project(&h).encoding.is_none() && project(&h).stream_path == cavlc);
+        for clip in [&cabac, &mp4] {
+            open(&mut h, clip.clone());
+            assert!(project(&h).encoding.is_some() && !cabac_slices(project(&h)), "{}", clip.display());
+        }
+
+        h.state_mut().settings.import_as_coded = true;
+        open(&mut h, cabac.clone());
+        assert!(project(&h).encoding.is_none() && project(&h).stream_path == cabac);
+        open(&mut h, mp4.clone());
+        let tools = Tools::find(None);
+        let copied = h264mosh::pipeline::load_annexb(&tools, &mp4).unwrap();
+        let p = project(&h);
+        assert!(p.encoding.is_none() && cabac_slices(p) && p.macroblocks);
+        assert!(*p.data == copied, "the stream is copied bit for bit");
+        assert!(p.stream_path.starts_with(test_dir().join("cache")));
+        open_all(&mut h, vec![mp4.clone(), mp4.clone()]);
+        assert_eq!(project(&h).source.len(), 100);
+        open_all(&mut h, vec![mp4.clone(), cavlc.clone()]);
+        assert!(h.state().notice.as_ref().is_some_and(|n| n.error && n.text.contains("coded differently")));
+
+        // a project without its stream copies it again
+        open(&mut h, mp4.clone());
+        let file = test_dir().join("coding.h264mosh");
+        assert!(h.state_mut().save_to(&file));
+        std::fs::remove_file(&project(&h).stream_path).unwrap();
+        let mut g = harness(false);
+        open(&mut g, file);
+        assert!(*project(&g).data == copied && project(&g).encoding.is_none());
+        assert!(g.state().dirty(), "the new stream is worth saving");
     }
 
     #[test]

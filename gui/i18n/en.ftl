@@ -39,6 +39,8 @@ import-bframes-pyramid =
        *[other] { $count } B-frames, also as references
     }
 import-bframes-pyramid-tooltip = Like B-frames, and some B-frames are references for the others (as most encoders do it), so moving one changes its neighbours too.
+import-as-coded = Keep the original coding: CABAC, MBAFF (experimental)
+import-as-coded-tooltip = Clips opened from now on are not re-encoded: their H.264 stream is used exactly as the camera or encoder made it, so the choices above do not apply. Clips joined this way have to be coded alike. Macroblock effects on CABAC streams are new; interlaced MBAFF streams take frame edits and the picture effects only. Without this, clips are encoded to CAVLC for moshing (raw CAVLC streams are used as they are).
 menu-edit = Edit
 menu-undo = Undo
 menu-redo = Redo
@@ -72,6 +74,7 @@ export-pending-tooltip = Render the pending changes first.
 cancel-button = Cancel
 stage-starting = Starting…
 stage-encoding = Encoding clip { $clip } of { $clips }
+stage-copying = Copying the stream of clip { $clip } of { $clips }
 stage-reading = Reading the stream…
 stage-rendering = Rendering…
 stage-exporting = Exporting…
@@ -134,7 +137,7 @@ card-tooltip-removed = Deleted here: { $frames }
 
 effects-title = Effects
 effects-none = No effects yet. Select frames and add one.
-effects-need-macroblocks = Most effects cannot edit the macroblocks of this stream (interlaced MBAFF, slice groups or SP/SI slices): open the clips from video files (they are re-encoded) instead of a raw stream. The picture effects work on any stream.
+effects-need-macroblocks = Most effects cannot edit the macroblocks of this stream (interlaced MBAFF, slice groups or SP/SI slices): open the clips re-encoded, with "Keep the original coding" switched off under File, New clips. The picture effects work on any stream.
 effects-select-first = Select the frames first.
 effect-add = Add effect
 effect-label = { $name } { $summary }

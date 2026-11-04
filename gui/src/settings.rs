@@ -20,6 +20,8 @@ pub struct Settings {
     /// B-frames of newly imported clips, and whether they are references too
     pub import_bframes: u32,
     pub import_b_pyramid: BPyramid,
+    /// newly imported clips keep their coding (no re-encoding; experimental)
+    pub import_as_coded: bool,
     /// where it is stored; None keeps it in memory only (tests)
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -34,6 +36,7 @@ impl Default for Settings {
             import_refs: 1,
             import_bframes: 0,
             import_b_pyramid: BPyramid::None,
+            import_as_coded: false,
             path: None,
         }
     }
