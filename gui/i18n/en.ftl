@@ -25,6 +25,20 @@ import-refs =
     }
 import-refs-one-tooltip = Clips opened from now on are encoded with one reference frame: the classic datamosh.
 import-refs-more-tooltip = Clips opened from now on are encoded with several reference frames, for the Echo effect. Frame edits work as well, but motion may come from older frames.
+import-bframes-none = No B-frames
+import-bframes-none-tooltip = Clips opened from now on have I- and P-frames only: every effect works on every frame.
+import-bframes =
+    { $count ->
+        [one] 1 B-frame
+       *[other] { $count } B-frames
+    }
+import-bframes-tooltip = Clips opened from now on get B-frames, which predict from the frames before and after them. Moved to other places they take their motion from new neighbours. Most effects change P-frames only.
+import-bframes-pyramid =
+    { $count ->
+        [one] 1 B-frame, also as reference
+       *[other] { $count } B-frames, also as references
+    }
+import-bframes-pyramid-tooltip = Like B-frames, and some B-frames are references for the others (as most encoders do it), so moving one changes its neighbours too.
 menu-edit = Edit
 menu-undo = Undo
 menu-redo = Redo

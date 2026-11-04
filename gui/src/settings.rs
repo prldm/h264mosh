@@ -2,6 +2,7 @@
 //! the user's configuration folder.
 
 use crate::export::ExportSettings;
+use h264mosh::pipeline::BPyramid;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,9 @@ pub struct Settings {
     pub export: ExportSettings,
     /// reference frames of newly imported clips
     pub import_refs: u32,
+    /// B-frames of newly imported clips, and whether they are references too
+    pub import_bframes: u32,
+    pub import_b_pyramid: BPyramid,
     /// where it is stored; None keeps it in memory only (tests)
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -23,7 +27,15 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { recent: Vec::new(), auto_render: false, export: ExportSettings::default(), import_refs: 1, path: None }
+        Self {
+            recent: Vec::new(),
+            auto_render: false,
+            export: ExportSettings::default(),
+            import_refs: 1,
+            import_bframes: 0,
+            import_b_pyramid: BPyramid::None,
+            path: None,
+        }
     }
 }
 

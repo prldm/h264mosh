@@ -77,7 +77,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn state(copies: i64) -> EditState {
-        let mut c = Cards::new(3);
+        let mut c = Cards::new(0..3);
         c.add_copies(&HashSet::from([0]), copies);
         c.state()
     }

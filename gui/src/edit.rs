@@ -129,9 +129,11 @@ pub struct Cards {
 }
 
 impl Cards {
-    /// Every source frame once; this is also what counts as rendered.
-    pub fn new(frames: usize) -> Self {
-        let cards = (0..frames)
+    /// Every source frame once, in display order (`order`); this is also what counts
+    /// as rendered.
+    pub fn new(order: impl IntoIterator<Item = usize>) -> Self {
+        let cards = order
+            .into_iter()
             .map(|src| Card {
                 id: src as CardId,
                 src,
@@ -414,7 +416,7 @@ mod tests {
 
     #[test]
     fn delete_leaves_a_tombstone_until_rendered() {
-        let mut c = Cards::new(5);
+        let mut c = Cards::new(0..5);
         c.set_deleted(&ids(&[1, 2]), true);
         assert_eq!(c.len(), 5);
         assert_eq!(srcs(&c), [0, 3, 4]);
@@ -428,7 +430,7 @@ mod tests {
 
     #[test]
     fn restoring_or_undoing_by_hand_is_not_pending() {
-        let mut c = Cards::new(3);
+        let mut c = Cards::new(0..3);
         c.set_deleted(&ids(&[1]), true);
         c.set_deleted(&ids(&[1]), false);
         c.add_copies(&ids(&[2]), 3);
@@ -440,7 +442,7 @@ mod tests {
 
     #[test]
     fn copies_are_clamped_and_seeded_by_occurrence() {
-        let mut c = Cards::new(3);
+        let mut c = Cards::new(0..3);
         c.add_copies(&ids(&[1]), -5);
         assert_eq!(c.cards[1].copies, 1);
         c.add_copies(&ids(&[1]), 2);
@@ -455,7 +457,7 @@ mod tests {
 
     #[test]
     fn move_keeps_order_and_marks_only_real_moves() {
-        let mut c = Cards::new(6);
+        let mut c = Cards::new(0..6);
         // [0 1 2 3 4 5] -> move 1 and 3 before 5
         assert!(c.move_to(&ids(&[3, 1]), 5));
         assert_eq!(srcs(&c), [0, 2, 4, 1, 3, 5]);
@@ -474,7 +476,7 @@ mod tests {
 
     #[test]
     fn markers_stay_in_place_when_cards_move() {
-        let mut c = Cards::new(5);
+        let mut c = Cards::new(0..5);
         c.set_deleted(&ids(&[1]), true);
         render(&mut c);
         // [0 | 2 3 4], the marker sits on card 2; a move onto itself keeps it there
@@ -495,7 +497,7 @@ mod tests {
 
     #[test]
     fn edits_made_during_a_render_stay_pending() {
-        let mut c = Cards::new(4);
+        let mut c = Cards::new(0..4);
         c.set_deleted(&ids(&[1]), true);
         let (_, snap) = c.timeline();
         // while rendering: delete 2, restore 1, move 3
@@ -509,7 +511,7 @@ mod tests {
 
     #[test]
     fn effects_follow_their_cards_and_apply_in_lane_order() {
-        let mut c = Cards::new(6);
+        let mut c = Cards::new(0..6);
         let scale = c.add_effect(MbEffect::MvScale(2.0, 2.0), &ids(&[1, 2, 3]));
         let kill = c.add_effect(MbEffect::KillIntra, &ids(&[3, 4]));
         assert_eq!(pending(&c), [1, 2, 3, 4]);
@@ -543,7 +545,7 @@ mod tests {
 
     #[test]
     fn only_randomized_effects_depend_on_the_seed() {
-        let mut c = Cards::new(6);
+        let mut c = Cards::new(0..6);
         c.add_effect(MbEffect::MvJitter(8), &ids(&[1]));
         c.add_effect(MbEffect::ZeroResidual, &ids(&[2]));
         c.add_effect(MbEffect::IntraRandom(0.5), &ids(&[3]));
@@ -556,7 +558,7 @@ mod tests {
 
     #[test]
     fn masks_go_with_their_effect() {
-        let mut c = Cards::new(4);
+        let mut c = Cards::new(0..4);
         let fx = c.add_effect(MbEffect::QpAdd(6), &ids(&[1, 2]));
         render(&mut c);
         let mask = Mask::rect(0.0, 0.5, 1.0, 0.5);
@@ -574,7 +576,7 @@ mod tests {
 
     #[test]
     fn state_roundtrips_through_json_and_restore() {
-        let mut c = Cards::new(5);
+        let mut c = Cards::new(0..5);
         c.add_effect(MbEffect::MvAdd(4, -2), &ids(&[1, 2]));
         c.set_deleted(&ids(&[3]), true);
         c.add_copies(&ids(&[4]), 2);
@@ -582,7 +584,7 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let back: EditState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, state);
-        let mut d = Cards::new(5);
+        let mut d = Cards::new(0..5);
         assert!(!d.is_state(&state));
         d.restore(back);
         assert!(d.is_state(&state));

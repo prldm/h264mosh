@@ -7,7 +7,7 @@ use crate::history::History;
 use crate::jobs::{Reporter, Stage};
 use anyhow::{Context, Result, bail};
 use h264mosh::mosh::{self, RenderOptions, RenderReport, Source, Timeline};
-use h264mosh::pipeline::{self, Cancelled, EncodeSettings, PrepProgress, Tools};
+use h264mosh::pipeline::{self, BPyramid, Cancelled, EncodeSettings, PrepProgress, Tools};
 use h264mosh::stream::{NalKind, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -41,6 +41,10 @@ pub struct Encoding {
     /// reference frames
     #[serde(default = "one")]
     pub refs: u32,
+    #[serde(default)]
+    pub bframes: u32,
+    #[serde(default)]
+    pub b_pyramid: BPyramid,
 }
 
 fn one() -> u32 {
@@ -48,9 +52,11 @@ fn one() -> u32 {
 }
 
 impl Encoding {
-    /// The `prep` defaults, with CAVLC so that macroblock effects work.
-    fn for_import(refs: u32) -> Self {
-        Self { preset: "medium".into(), crf: 18.0, keyint: "250".into(), scenecut: true, cavlc: true, refs: refs.max(1) }
+    /// The `prep` defaults, with CAVLC so that macroblock effects work, and the
+    /// reference and B-frames chosen for new clips.
+    pub fn for_import(refs: u32, bframes: u32, b_pyramid: BPyramid) -> Self {
+        let (preset, keyint) = ("medium".into(), "250".into());
+        Self { preset, crf: 18.0, keyint, scenecut: true, cavlc: true, refs: refs.max(1), bframes, b_pyramid }
     }
 
     fn settings(&self) -> EncodeSettings {
@@ -61,6 +67,8 @@ impl Encoding {
             scenecut: self.scenecut,
             cavlc: self.cavlc,
             refs: self.refs,
+            bframes: self.bframes,
+            b_pyramid: self.b_pyramid,
             x264_params: None,
         }
     }
@@ -255,7 +263,7 @@ fn load(
     }
     let frames = source.aus.iter().map(|au| FrameInfo { kind: au.picture_type(), idr: au.is_idr() }).collect();
     let fps = pipeline::stream_fps(&data);
-    let cards = Cards::new(source.len());
+    let cards = Cards::new(source.display.iter().copied());
     r.set(Stage::Rendering, 0, None);
     let (timeline, _) = cards.timeline();
     let original = Arc::new(render(&source, &timeline, cards.output().into_iter().map(|(c, _)| c).collect())?);
@@ -281,8 +289,8 @@ fn load(
 }
 
 /// Open clips: a single raw H.264 stream is used as it is; anything else is encoded
-/// with mosh-friendly settings (and `refs` reference frames) into `cache_dir` first.
-pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, refs: u32, r: &Reporter) -> Result<Imported> {
+/// with mosh-friendly settings (`encoding`) into `cache_dir` first.
+pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, encoding: Encoding, r: &Reporter) -> Result<Imported> {
     let name = inputs.first().map(|p| name_of(p)).unwrap_or_default();
     let project = if let [single] = inputs
         && pipeline::is_raw_h264(single)
@@ -291,7 +299,6 @@ pub fn import(tools: &Tools, inputs: &[PathBuf], cache_dir: &Path, refs: u32, r:
         let data = std::fs::read(single).with_context(|| format!("reading {}", single.display()))?;
         load(name, inputs.to_vec(), single.clone(), None, data, r)?
     } else {
-        let encoding = Encoding::for_import(refs);
         let (stream, data) = prepare(tools, inputs, cache_dir, &encoding, r)?;
         load(name, inputs.to_vec(), stream, Some(encoding), data, r)?
     };
@@ -381,10 +388,11 @@ pub fn export(tools: &Tools, rendered: &Rendered, fps: &str, path: &Path, settin
     }
 }
 
-/// Decode the source at thumbnail size, sending (frame, RGBA pixels) until `send`
-/// returns false. Errors end the feed: thumbnails are optional.
-pub fn thumbnails(tools: &Tools, data: &[u8], size: (u32, u32), send: &mut dyn FnMut((usize, Vec<u8>)) -> bool) {
-    let _ = pipeline::decode_rgba(tools, data, size, |i, px| send((i, px)));
+/// Decode the source at thumbnail size, sending (source frame, RGBA pixels) until
+/// `send` returns false. Errors end the feed: thumbnails are optional.
+pub fn thumbnails(tools: &Tools, source: &Source, data: &[u8], size: (u32, u32), send: &mut dyn FnMut((usize, Vec<u8>)) -> bool) {
+    // the decoder gives the pictures in display order
+    let _ = pipeline::decode_rgba(tools, data, size, |i, px| source.display.get(i).is_some_and(|&src| send((src, px))));
 }
 
 #[cfg(test)]

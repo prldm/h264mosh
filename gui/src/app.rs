@@ -4,12 +4,12 @@ use crate::history::Gesture;
 use crate::jobs::{Feed, Job, Stage};
 use crate::panel::{self, Action};
 use crate::preview::Preview;
-use crate::project::{self, Imported, PROJECT_EXTENSION, Project, RenderRequest, Rendered};
+use crate::project::{self, Encoding, Imported, PROJECT_EXTENSION, Project, RenderRequest, Rendered};
 use crate::settings::Settings;
 use crate::timeline::{Event, Strip, TimelineView};
 use crate::tr;
 use eframe::egui::{self, Align, Key, Layout, Modifiers, RichText, Sense, Vec2};
-use h264mosh::pipeline::{Cancelled, Tools};
+use h264mosh::pipeline::{BPyramid, Cancelled, Tools};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -155,8 +155,9 @@ impl App {
                 Job::spawn(ctx, move |r| project::open(&tools, &file, &cache_dir, r))
             }
             _ => {
-                let refs = self.settings.import_refs;
-                Job::spawn(ctx, move |r| project::import(&tools, &paths, &cache_dir, refs, r))
+                let s = &self.settings;
+                let encoding = Encoding::for_import(s.import_refs, s.import_bframes, s.import_b_pyramid);
+                Job::spawn(ctx, move |r| project::import(&tools, &paths, &cache_dir, encoding, r))
             }
         };
         self.job = Some(Running::Open(job));
@@ -305,8 +306,8 @@ impl App {
                 project.saved = Some(project.cards.state());
             }
         }
-        let (tools, data, size) = (self.tools.clone(), project.data.clone(), project.thumb_size());
-        self.thumb_feed = Some(Feed::spawn(ctx, move |send| project::thumbnails(&tools, &data, size, send)));
+        let (tools, source, data, size) = (self.tools.clone(), project.source.clone(), project.data.clone(), project.thumb_size());
+        self.thumb_feed = Some(Feed::spawn(ctx, move |send| project::thumbnails(&tools, &source, &data, size, send)));
         self.thumbs = vec![None; project.source.len()];
         self.preview = Some(Preview::new(self.tools.clone(), rendered, project.preview_size(), PREVIEW_CACHE));
         self.original = Some(Preview::new(self.tools.clone(), project.original.clone(), project.preview_size(), ORIGINAL_CACHE));
@@ -605,6 +606,20 @@ impl App {
                         let hint = if refs == 1 { tr!("import-refs-one-tooltip") } else { tr!("import-refs-more-tooltip") };
                         if ui.radio_value(&mut self.settings.import_refs, refs, label).on_hover_text(hint).changed() {
                             self.settings.save();
+                        }
+                    }
+                    ui.separator();
+                    let s = &mut self.settings;
+                    let choices = [
+                        (0, BPyramid::None, tr!("import-bframes-none"), tr!("import-bframes-none-tooltip")),
+                        (3, BPyramid::None, tr!("import-bframes", count = 3), tr!("import-bframes-tooltip")),
+                        (3, BPyramid::Normal, tr!("import-bframes-pyramid", count = 3), tr!("import-bframes-pyramid-tooltip")),
+                    ];
+                    for (bframes, pyramid, label, hint) in choices {
+                        let chosen = s.import_bframes == bframes && (bframes == 0 || s.import_b_pyramid == pyramid);
+                        if ui.radio(chosen, label).on_hover_text(hint).clicked() && !chosen {
+                            (s.import_bframes, s.import_b_pyramid) = (bframes, pyramid);
+                            s.save();
                         }
                     }
                 });
@@ -1397,6 +1412,31 @@ mod tests {
         open(&mut k, mp4);
         assert_eq!(project(&k).refs, 2);
         assert_eq!(project(&k).encoding.as_ref().unwrap().refs, 2);
+    }
+
+    /// Clips imported with B-frames: the timeline shows them in display order, with
+    /// their thumbnails, and a B-frame moved elsewhere renders.
+    #[test]
+    fn bframe_clips_edit_in_display_order() {
+        let Some(mp4) = test_clip("bframes.mp4", 2, "320x180") else { return };
+        let mut h = harness(false);
+        h.state_mut().settings.import_bframes = 3;
+        open(&mut h, mp4);
+        let p = project(&h);
+        assert_eq!(p.encoding.as_ref().unwrap().bframes, 3);
+        let srcs: Vec<usize> = p.cards.cards.iter().map(|c| c.src).collect();
+        assert_eq!(srcs, p.source.display);
+        assert_ne!(srcs, (0..srcs.len()).collect::<Vec<_>>(), "B-frames are decoded after the frame they precede");
+        let b = p.cards.cards.iter().find(|c| p.frames[c.src].kind == 'B').unwrap().clone();
+        assert!(b.src < 19);
+        wait(&mut h, |a| a.thumbs.iter().all(Option::is_some));
+        h.state_mut().project.as_mut().unwrap().cards.move_to(&HashSet::from([b.id]), 20);
+        render(&mut h);
+        assert!(h.state().notice.is_none(), "{}", h.state().notice.as_ref().unwrap().text);
+        let out = rendered(&h);
+        assert_eq!(out.len(), srcs.len());
+        assert_eq!(out.frame_of(b.id), Some(19));
+        assert_eq!(out.report.frames[19].src, b.src);
     }
 
     #[test]
