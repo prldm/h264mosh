@@ -8,6 +8,7 @@
 
 use crate::sps::Sps;
 use crate::stream::{NalKind, Stream, group_access_units};
+use crate::ts;
 use anyhow::{Context, Result, bail};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -417,13 +418,29 @@ pub fn render(
 /// players decode the moshed stream themselves. `progress` as in `render`.
 pub fn remux(tools: &Tools, data: &[u8], output: &Path, fps: &str, progress: &mut dyn FnMut(u64) -> bool) -> Result<()> {
     let mut cmd = tools.ffmpeg_with_progress();
-    cmd.args(["-y", "-f", "h264", "-framerate", fps, "-i", "pipe:0", "-c:v", "copy"]);
+    // with B-frames the container needs timestamps, which raw H.264 does not have
+    let rate = fps_ratio(fps).with_context(|| format!("frame rate {fps}"))?;
+    let timed = ts::with_timestamps(data, rate)?;
+    if timed.is_some() {
+        cmd.args(["-y", "-f", "mpegts", "-i", "pipe:0", "-c:v", "copy"]);
+    } else {
+        cmd.args(["-y", "-f", "h264", "-framerate", fps, "-i", "pipe:0", "-c:v", "copy"]);
+    }
     if output.extension().is_some_and(|e| e == OsStr::new("mp4") || e == OsStr::new("mov")) {
         cmd.args(["-movflags", "+faststart"]);
     }
     cmd.arg(output);
-    tools.run_with_progress(cmd, data, progress)?;
+    tools.run_with_progress(cmd, timed.as_deref().unwrap_or(data), progress)?;
     Ok(())
+}
+
+/// "30000/1001", "25" or "29.97" as (numerator, denominator)
+fn fps_ratio(fps: &str) -> Option<(u64, u64)> {
+    let (n, d) = fps.split_once('/').unwrap_or((fps, "1"));
+    match (n.trim().parse(), d.trim().parse()) {
+        (Ok(n), Ok(d)) if n > 0 && d > 0 => Some((n, d)),
+        _ => Some(((fps_value(fps)? * 1000.0).round() as u64, 1000)).filter(|r| r.0 > 0),
+    }
 }
 
 /// Decode a raw stream into RGBA frames of `width`x`height` (bilinear scaling), with

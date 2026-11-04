@@ -1054,3 +1054,25 @@ fn prep_can_use_bframes() {
     let n = src.len();
     render_checked(&src, &shown(&src, (0..3).chain((3..n).rev())), "prep_bframes");
 }
+
+/// Copied into a container, a stream with B-frames keeps every picture in its place.
+#[test]
+fn remux_keeps_bframe_pictures() {
+    if !ffmpeg_available() {
+        return;
+    }
+    for (name, data) in bframe_configs().into_iter().skip(1).take(2) {
+        let src = Source::new(Stream::parse(&data).unwrap());
+        let n = src.len();
+        for (case, timeline) in [("orig", src.timeline()), ("edit", shown(&src, (0..10).chain((10..40).rev()).chain(40..n)))] {
+            let (out, _) = render(&src, &timeline, &RenderOptions::default()).unwrap();
+            let bytes = out.write(false).unwrap();
+            let (raw, _) = decode(&bytes, "remux_b.264");
+            let mp4 = tmp("remux_b.mp4");
+            remux(&Tools::find(None), &bytes, &mp4, "24000/1001", &mut |_| true).unwrap();
+            let (md5, err) = decode(&std::fs::read(&mp4).unwrap(), "remux_b.mp4");
+            assert!(err.is_empty(), "{name} {case}: {err}");
+            assert!(md5 == raw, "{name} {case}: remuxed pictures differ ({} vs {})", md5.len(), raw.len());
+        }
+    }
+}
